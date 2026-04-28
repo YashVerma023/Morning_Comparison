@@ -172,12 +172,31 @@ def to_excel(diff, not_found, extra, duplicate):
 # -----------------------------
 # UI
 # -----------------------------
-st.title("User Reconciliation Tool")
+st.set_page_config(page_title="Morning Sheet Comparison", layout="wide")
 
-file_all = st.file_uploader("Upload All Users Excel", type=["xlsx"])
-file_run = st.file_uploader("Upload Running Users", type=["csv", "xlsx"])
+# HEADER
+st.markdown(
+    """
+    <h1 style='text-align: center; color: #1f77b4;'>Megaserve Technologies</h1>
+    <h3 style='text-align: center; color: gray;'>Morning Sheet Comparison</h3>
+    <hr>
+    """,
+    unsafe_allow_html=True
+)
+
+# FILE UPLOAD SECTION
+col1, col2 = st.columns(2)
+
+with col1:
+    file_all = st.file_uploader("📂 Upload All Users Excel", type=["xlsx"])
+
+with col2:
+    file_run = st.file_uploader("📂 Upload Running Users", type=["csv", "xlsx"])
+
 
 if file_all and file_run:
+
+    st.success("✅ Files uploaded successfully. Processing...")
 
     df_all = load_all_users(file_all)
     df_run = load_running_users(file_run)
@@ -210,26 +229,50 @@ if file_all and file_run:
     # Not Found
     not_found_tab = get_not_found(df_all_clean, df_run_clean)
 
-    # UI
-    tab1, tab2, tab3, tab4 = st.tabs(["Difference", "Not Found", "Extra", "Duplicate"])
+    # -----------------------------
+    # SUMMARY METRICS
+    # -----------------------------
+    st.markdown("### 📊 Summary")
+
+    m1, m2, m3, m4 = st.columns(4)
+
+    m1.metric("Differences", len(diff_tab))
+    m2.metric("Not Found", len(not_found_tab))
+    m3.metric("Extra Accounts", len(extra_tab))
+    m4.metric("Duplicates", len(duplicate_tab))
+
+    st.markdown("---")
+
+    # -----------------------------
+    # TABS
+    # -----------------------------
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["🔍 Difference", "❌ Not Found", "📦 Extra", "⚠️ Duplicate"]
+    )
 
     with tab1:
-        st.dataframe(diff_tab)
+        st.subheader("Differences Between Sheets")
+        st.dataframe(diff_tab, use_container_width=True)
 
     with tab2:
-        st.dataframe(not_found_tab)
+        st.subheader("Missing Users")
+        st.dataframe(not_found_tab, use_container_width=True)
 
     with tab3:
-        st.dataframe(extra_tab)
+        st.subheader("Excluded / Extra Accounts")
+        st.dataframe(extra_tab, use_container_width=True)
 
     with tab4:
-        st.dataframe(duplicate_tab)
+        st.subheader("Duplicate User IDs")
+        st.dataframe(duplicate_tab, use_container_width=True)
 
-    # Download
+    # -----------------------------
+    # DOWNLOAD BUTTON
+    # -----------------------------
     excel = to_excel(diff_tab, not_found_tab, extra_tab, duplicate_tab)
 
     st.download_button(
-        "Download Report",
+        "⬇️ Download Full Report",
         data=excel,
         file_name="user_comparison.xlsx"
     )
