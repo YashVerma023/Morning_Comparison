@@ -245,17 +245,23 @@ def get_not_found(all_df: pd.DataFrame, run_df: pd.DataFrame) -> pd.DataFrame:
     all_ids = set(all_df["userid"])
     run_ids = set(run_df["userid"])
 
-    missing_in_run = pd.DataFrame({
-        "userid": list(all_ids - run_ids),
-        "Not found in": "Running",
-    })
+    # Users in All Users but not in Running — pull server/algo from All Users
+    missing_in_run = (
+        all_df[all_df["userid"].isin(all_ids - run_ids)][["userid", "server", "algo"]]
+        .copy()
+    )
+    missing_in_run["Not found in"] = "Running"
 
-    missing_in_all = pd.DataFrame({
-        "userid": list(run_ids - all_ids),
-        "Not found in": "All User",
-    })
+    # Users in Running but not in All Users — pull server/algo from Running
+    missing_in_all = (
+        run_df[run_df["userid"].isin(run_ids - all_ids)][["userid", "server", "algo"]]
+        .copy()
+    )
+    missing_in_all["Not found in"] = "All User"
 
-    return pd.concat([missing_in_run, missing_in_all], ignore_index=True)
+    return pd.concat([missing_in_run, missing_in_all], ignore_index=True)[
+        ["userid", "server", "algo", "Not found in"]
+    ]
 
 # -----------------------------
 # EXPORT
