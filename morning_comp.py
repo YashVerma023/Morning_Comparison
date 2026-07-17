@@ -254,6 +254,69 @@ def get_not_found(all_df: pd.DataFrame, run_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # -----------------------------
+# PIVOT / SUMMARY TABLES
+# -----------------------------
+def build_not_found_summary(not_found_tab: pd.DataFrame) -> pd.DataFrame:
+    """
+    Pivot of the Not Found tab: count of distinct userid per algo/server,
+    broken out by which sheet they were missing from.
+    Columns: algo, server, count_of_user, not_found_in
+    """
+    if not_found_tab.empty:
+        return pd.DataFrame(columns=["algo", "server", "count_of_user", "Not found in"])
+    summary = (
+        not_found_tab
+        .groupby(["algo", "server", "Not found in"], dropna=False)["userid"]
+        .nunique()
+        .reset_index()
+        .rename(columns={"userid": "count_of_user"})
+    )
+    summary = summary[["algo", "server", "count_of_user", "Not found in"]]
+    return summary.sort_values(["algo", "server", "Not found in"]).reset_index(drop=True)
+
+
+ALL_USER_COUNT_COL = "count of user_id All user"
+RUNNING_COUNT_COL = "count of user_id running"
+
+
+def _distinct_userid_counts(df: pd.DataFrame, count_col: str) -> pd.DataFrame:
+    if df.empty or "algo" not in df.columns or "server" not in df.columns:
+        return pd.DataFrame(columns=["algo", "server", count_col])
+    return (
+        df.groupby(["algo", "server"], dropna=False)["userid"]
+        .nunique()
+        .reset_index()
+        .rename(columns={"userid": count_col})
+    )
+
+
+def build_running_pivot(df_all_mode_filtered: pd.DataFrame, df_run_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Pivot combining, per algo/server:
+      - count of user_id All user: distinct userid from the All Users sheet,
+        filtered ONLY by the active DTE mode's RunningType/RunningDays rule
+        (0DTE -> no filter/all counted, 1DTE -> RunningType in {POS, INT} &
+        RunningDays in {DAILY, 1DTE/0DTE}, 4DTE -> RunningType = POS &
+        RunningDays = DAILY). No dedup / server-exclusion is applied here,
+        only the mode filter.
+      - count of user_id running: distinct userid from the Running Users
+        sheet exactly as uploaded (before dedup / server exclusions).
+    Columns: algo, server, count of user_id All user, count of user_id running
+    """
+    all_counts = _distinct_userid_counts(df_all_mode_filtered, ALL_USER_COUNT_COL)
+    run_counts = _distinct_userid_counts(df_run_raw, RUNNING_COUNT_COL)
+
+    summary = pd.merge(all_counts, run_counts, on=["algo", "server"], how="outer")
+    for col in (ALL_USER_COUNT_COL, RUNNING_COUNT_COL):
+        if col not in summary.columns:
+            summary[col] = 0
+        summary[col] = summary[col].fillna(0).astype(int)
+
+    summary = summary[["algo", "server", ALL_USER_COUNT_COL, RUNNING_COUNT_COL]]
+    return summary.sort_values(["algo", "server"]).reset_index(drop=True)
+
+
+# -----------------------------
 # FIX REMARK PARSING
 # -----------------------------
 _FIX_PATTERN = re.compile(
@@ -354,11 +417,17 @@ def to_excel(
     duplicate: pd.DataFrame,
     fixed: pd.DataFrame,
     allocation: pd.DataFrame,
+    not_found_summary: Optional[pd.DataFrame] = None,
+    running_summary: Optional[pd.DataFrame] = None,
 ) -> io.BytesIO:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        if running_summary is not None:
+            running_summary.to_excel(writer, sheet_name="Summary", index=False)
         diff.to_excel(writer, sheet_name="Difference", index=False)
         not_found.to_excel(writer, sheet_name="Not Found", index=False)
+        if not_found_summary is not None:
+            not_found_summary.to_excel(writer, sheet_name="Not Found Summary", index=False)
         extra.to_excel(writer, sheet_name="Extra", index=False)
         duplicate.to_excel(writer, sheet_name="Duplicate", index=False)
 
@@ -383,6 +452,51 @@ def to_excel(
 # UI
 # -----------------------------
 st.set_page_config(page_title="Morning Sheet Comparison", layout="wide")
+
+# Tighten default Streamlit spacing so tables/sections read as a clean,
+# client-ready report instead of the default airy dashboard look.
+st.markdown(
+    """
+    <style>
+        .block-container {
+            padding-top: 1.75rem;
+            padding-bottom: 1.5rem;
+        }
+        h1, h2, h3 { margin-bottom: 0.25rem; }
+        [data-testid="stCaptionContainer"] { margin-bottom: 0.5rem; }
+        hr { margin: 0.6rem 0 1rem 0; }
+        div[data-testid="stMetric"] {
+            background-color: rgba(127, 127, 127, 0.07);
+            border-radius: 6px;
+            padding: 8px 10px;
+        }
+        div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stDataFrame"]) {
+            margin-bottom: 0.25rem;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+def render_table(df, hide_index: bool = True) -> None:
+    """
+    Render any table (plain DataFrame or a pandas Styler from .style.apply()
+    / .format()) sized to its actual column count, instead of always
+    stretching to the full page width. A 2-4 column table stretched with
+    use_container_width=True leaves a large, unprofessional empty gap on
+    wide screens; a wide table (~9+ columns) genuinely needs the space.
+    This scales the rendered width to fit the content either way.
+    """
+    underlying = df.data if hasattr(df, "data") else df
+    n_cols = max(len(underlying.columns), 1)
+    width_fraction = min(1.0, max(0.3, 0.12 + 0.10 * n_cols))
+    if width_fraction >= 0.98:
+        st.dataframe(df, use_container_width=True, hide_index=hide_index)
+    else:
+        col, _ = st.columns([width_fraction, 1 - width_fraction])
+        with col:
+            st.dataframe(df, use_container_width=True, hide_index=hide_index)
+
 
 with st.sidebar:
     st.markdown("### Comparison Mode")
@@ -429,7 +543,15 @@ if file_all and file_run:
     df_all = normalize_values(normalize_columns(df_all), is_running=False)
     df_run = normalize_values(normalize_columns(df_run), is_running=True)
 
+    # Raw running snapshot (as uploaded, before dedup / server exclusions) --
+    # used for the Summary tab pivot.
+    df_run_raw = df_run.copy()
+
     df_all = apply_mode_filter(df_all, mode)
+
+    # Snapshot right after the DTE mode filter only (no dedup / server
+    # exclusions yet) -- used for the Summary tab's "All user" count.
+    df_all_mode_filtered = df_all.copy()
 
     dup_all = get_duplicates(df_all, "All User")
     dup_run = get_duplicates(df_run, "Running")
@@ -456,6 +578,9 @@ if file_all and file_run:
 
     allocation_tab = build_allocation_tab(df_all_clean, mode)
 
+    not_found_summary_tab = build_not_found_summary(not_found_tab)
+    running_pivot_tab = build_running_pivot(df_all_mode_filtered, df_run_raw)
+
     # --- SUMMARY ---
     st.markdown(f"### Summary -- {mode}")
     m1, m2, m3, m4, m5, m6 = st.columns(6)
@@ -469,25 +594,45 @@ if file_all and file_run:
     st.markdown("---")
 
     # --- TABS ---
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["Difference", "Not Found", "Extra", "Duplicate", "Fixed", "Allocation"]
+    tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["Summary", "Difference", "Not Found", "Extra", "Duplicate", "Fixed", "Allocation"]
     )
+
+    with tab0:
+        st.subheader(f"Running Users Pivot -- {mode}")
+        st.caption(
+            "Distinct userid count per Algo / Server. **All user** = from the "
+            f"All Users sheet filtered only by the **{mode}** RunningType/RunningDays "
+            "rule (no dedup / server exclusions applied here). **Running** = from "
+            "the Running Users sheet exactly as uploaded (before dedup / server exclusions)."
+        )
+        if running_pivot_tab.empty:
+            st.info("No data available to summarize.")
+        else:
+            render_table(running_pivot_tab)
 
     with tab1:
         st.subheader("Differences Between Sheets")
-        st.dataframe(diff_tab, use_container_width=True)
+        render_table(diff_tab)
 
     with tab2:
         st.subheader("Missing Users")
-        st.dataframe(not_found_tab, use_container_width=True)
+        render_table(not_found_tab)
+
+        st.markdown("---")
+        st.subheader("Missing Users -- Summary by Algo / Server")
+        if not_found_summary_tab.empty:
+            st.info("No missing users to summarize.")
+        else:
+            render_table(not_found_summary_tab)
 
     with tab3:
         st.subheader("Excluded / Extra Accounts")
-        st.dataframe(extra_tab, use_container_width=True)
+        render_table(extra_tab)
 
     with tab4:
         st.subheader("Duplicate User IDs")
-        st.dataframe(duplicate_tab, use_container_width=True)
+        render_table(duplicate_tab)
 
     with tab5:
         st.subheader("Fixed Allocation Accounts")
@@ -504,11 +649,7 @@ if file_all and file_run:
             c1.metric("Total FIX Accounts", len(fixed_tab))
             c2.metric("Matching", int(fixed_tab["_match"].sum()))
             c3.metric("Mismatched", fixed_mismatches)
-            st.dataframe(
-                style_fixed_tab(fixed_tab),
-                use_container_width=True,
-                hide_index=True,
-            )
+            render_table(style_fixed_tab(fixed_tab))
 
     with tab6:
         threshold = ALLOC_THRESHOLD.get(mode)
@@ -526,17 +667,16 @@ if file_all and file_run:
                 def _style_alloc_row(row):
                     return ["background-color: #e65100; color: #ffffff; font-weight: bold"] * len(row)
 
-                st.dataframe(
+                render_table(
                     allocation_tab.style.apply(_style_alloc_row, axis=1).format(
                         {"allocation": "{:,.0f}"}
-                    ),
-                    use_container_width=True,
-                    hide_index=True,
+                    )
                 )
 
     # --- DOWNLOAD ---
     excel_bytes = to_excel(
-        diff_tab, not_found_tab, extra_tab, duplicate_tab, fixed_tab, allocation_tab
+        diff_tab, not_found_tab, extra_tab, duplicate_tab, fixed_tab, allocation_tab,
+        not_found_summary=not_found_summary_tab, running_summary=running_pivot_tab,
     )
     st.download_button(
         "Download Full Report",
