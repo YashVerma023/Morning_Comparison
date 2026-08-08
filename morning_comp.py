@@ -1,6 +1,5 @@
 import io
 import logging
-import re
 from typing import Optional, Tuple
 
 import numpy as np
@@ -61,6 +60,49 @@ MODE_FILTERS = {
 MAIN_SHEET_NAMES = {"main", "mfibain"}
 
 # -----------------------------
+# FIXED ALLOCATION
+# -----------------------------
+# Internal name for the "FIX (CR)" column on the All Users (Main) sheet.
+FIX_CR_COL = "fix_cr"
+
+# Expected allocation = FIX (CR) value x this multiplier.
+# The sheet stores allocation in a scaled unit where 1 CR == 100,000,
+# so FIX (CR) = 1.6 -> 160,000 and FIX (CR) = 0.8 -> 80,000.
+FIX_CR_MULTIPLIER = 100_000
+
+# Cell values that mean "no fixed allocation" rather than "bad data".
+FIX_CR_BLANK_TOKENS = {"", "nan", "none", "null", "-", "na", "n/a"}
+
+FIXED_TAB_COLUMNS = [
+    "userid", "alias", "server", "algo", FIX_CR_COL,
+    "expected_allocation", "actual_allocation", "status", "_match",
+]
+
+FIX_CR_INVALID_COLUMNS = ["userid", "alias", "server", "algo", "fix_cr_raw", "reason"]
+
+# -----------------------------
+# OPERATOR
+# -----------------------------
+# Internal name for the "Operator Name" column on the All Users (Main) sheet.
+OPERATOR_COL = "operator_name"
+
+# Operator is resolved from the All Users sheet by (algo, server) and appended
+# as the LAST column of every table. The Running Users file has no operator
+# column, so running-sourced rows are resolved through the same lookup.
+OPERATOR_UNKNOWN = ""
+
+# -----------------------------
+# 0 SL
+# -----------------------------
+# Internal name for the "SL" column on the All Users (Main) sheet.
+SL_COL = "sl"
+
+# Only a numeric zero counts as "0 SL". A blank cell means "no SL recorded"
+# and is deliberately NOT counted.
+ZERO_SL_COUNT_COL = "count of 0 SL accounts"
+ZERO_SL_COLUMNS = ["algo", "server", ZERO_SL_COUNT_COL, OPERATOR_COL]
+
+# -----------------------------
 # COLUMN NORMALIZATION
 # -----------------------------
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -82,6 +124,17 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "remarks/algo8previousdayrealisedmtm": "remark",
         "remarks": "remark",
         "remark": "remark",
+        # "FIX (CR)" -> lower/strip/space-stripped -> "fix(cr)"
+        "fix(cr)": FIX_CR_COL,
+        "fixcr": FIX_CR_COL,
+        "fix(crore)": FIX_CR_COL,
+        "fix(cr.)": FIX_CR_COL,
+        # "SL" -> "sl". Distinct from "Check SL" ("checksl") and
+        # "Sl Check" ("slcheck"), which are left untouched.
+        "sl": SL_COL,
+        # "Operator Name" -> "operatorname"
+        "operatorname": OPERATOR_COL,
+        "operator": OPERATOR_COL,
     }
     return df.rename(columns=column_map)
 
@@ -116,6 +169,14 @@ def normalize_values(df: pd.DataFrame, is_running: bool = False) -> pd.DataFrame
                 .str.replace(" ", "", regex=False)
                 .str.lower()
             )
+    if OPERATOR_COL in df.columns:
+        df[OPERATOR_COL] = (
+            df[OPERATOR_COL]
+            .astype(str)
+            .str.strip()
+            .replace({"nan": OPERATOR_UNKNOWN, "None": OPERATOR_UNKNOWN,
+                      "NaT": OPERATOR_UNKNOWN, "<NA>": OPERATOR_UNKNOWN})
+        )
     return df
 
 
@@ -187,9 +248,13 @@ def load_running_users(file) -> pd.DataFrame:
 # DUPLICATES
 # -----------------------------
 def get_duplicates(df: pd.DataFrame, source: str) -> pd.DataFrame:
+    """
+    Duplicate user IDs. algo/server are carried through so the caller can
+    resolve the operator; they are dropped before display.
+    """
     dup = df[df.duplicated(subset=["userid"], keep=False)].copy()
     dup["Found in"] = source
-    return dup[["userid", "Found in"]]
+    return dup[["userid", "algo", "server", "Found in"]]
 
 
 def remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
@@ -317,57 +382,239 @@ def build_running_pivot(df_all_mode_filtered: pd.DataFrame, df_run_raw: pd.DataF
 
 
 # -----------------------------
-# FIX REMARK PARSING
+# OPERATOR LOOKUP
 # -----------------------------
-_FIX_PATTERN = re.compile(
-    r"(?:FIX(?:ED)?)\s*(?:(?:AT|ON|FOR)\s*)?(\d+(?:\.\d+)?)\s*(CR|L)\b",
-    re.IGNORECASE,
-)
+def build_operator_lookup(df_all: pd.DataFrame) -> dict:
+    """
+    Build an (algo, server) -> operator_name lookup from the All Users sheet.
+
+    Operator is an attribute of the algo/server pair rather than of the
+    individual account, which is what lets running-sourced rows (the Running
+    Users file carries no operator column) be resolved through the same map.
+
+    If a pair somehow carries more than one operator, the most frequent one
+    wins and a warning is logged -- the alternative, silently picking an
+    arbitrary row, would misattribute accounts.
+    """
+    if OPERATOR_COL not in df_all.columns:
+        logger.warning(
+            "No 'Operator Name' column found in the main sheet -- "
+            "operator will be blank in every table."
+        )
+        return {}
+
+    df = df_all[["algo", "server", OPERATOR_COL]].copy()
+    df = df[df[OPERATOR_COL].notna() & (df[OPERATOR_COL] != OPERATOR_UNKNOWN)]
+    if df.empty:
+        logger.warning("'Operator Name' column is present but entirely empty.")
+        return {}
+
+    lookup: dict = {}
+    ambiguous: list = []
+    for (algo, server), group in df.groupby(["algo", "server"], dropna=False):
+        counts = group[OPERATOR_COL].value_counts()
+        lookup[(algo, server)] = counts.index[0]
+        if len(counts) > 1:
+            ambiguous.append(f"algo {algo} / {server}: {list(counts.index)}")
+
+    if ambiguous:
+        logger.warning(
+            "%d algo/server pair(s) map to more than one operator; using the "
+            "most frequent. %s", len(ambiguous), "; ".join(ambiguous),
+        )
+    logger.info("Operator lookup built for %d algo/server pair(s).", len(lookup))
+    return lookup
 
 
-def parse_fix_allocation(remark: str) -> Optional[float]:
+def attach_operator(
+    df: pd.DataFrame,
+    lookup: dict,
+    algo_col: str = "algo",
+    server_col: str = "server",
+) -> pd.DataFrame:
     """
-    Parse fixed allocation amount from a remark string.
-    FIX N CR  -> N x 100,000
-    FIX N L   -> N x 1,000
-    Returns None if no FIX pattern is found.
+    Append operator_name as the LAST column of df.
+
+    Uses a dict lookup rather than a merge on purpose: a merge can silently
+    multiply rows if the right-hand side is not unique, and can reorder the
+    frame. This maps positionally, so row count and order are guaranteed
+    unchanged. Unresolved pairs get a blank operator, never a wrong one.
     """
-    if not isinstance(remark, str):
-        return None
-    m = _FIX_PATTERN.search(remark)
-    if not m:
-        return None
-    amount = float(m.group(1))
-    unit = m.group(2).upper()
-    return amount * 100_000 if unit == "CR" else amount * 1_000
+    out = df.copy()
+    if algo_col not in out.columns or server_col not in out.columns:
+        logger.warning(
+            "Cannot attach operator: missing '%s' / '%s'.", algo_col, server_col
+        )
+        out[OPERATOR_COL] = OPERATOR_UNKNOWN
+        return out
+
+    out[OPERATOR_COL] = [
+        lookup.get((algo, server), OPERATOR_UNKNOWN)
+        for algo, server in zip(out[algo_col], out[server_col])
+    ]
+    return out
+
+
+# -----------------------------
+# 0 SL PIVOT
+# -----------------------------
+def coerce_sl(series: pd.Series) -> pd.Series:
+    """
+    Coerce the raw SL column to numeric.
+
+    Accepts 0, 0.0, "0", " 0 " and "0%". Blank/empty cells and non-numeric
+    text become NaN, so they are never counted as zero.
+    """
+    cleaned = (
+        series.astype(str)
+        .str.strip()
+        .str.rstrip("%")
+        .str.strip()
+    )
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
+def build_zero_sl_pivot(df_all: pd.DataFrame, operator_lookup: dict) -> pd.DataFrame:
+    """
+    Pivot of accounts running with zero stop-loss.
+
+    Columns: algo | server | count of 0 SL accounts | operator_name
+
+    Counts distinct userid per algo/server where the SL column is numerically
+    zero. A blank SL cell means "no SL recorded" and is NOT counted.
+
+    The caller passes the All Users frame already filtered by the active DTE
+    mode; no server exclusions are applied, so NOT RUNNING / DLR ACC / Z SERVER
+    accounts still surface here.
+    """
+    empty = pd.DataFrame(columns=ZERO_SL_COLUMNS)
+
+    if SL_COL not in df_all.columns:
+        logger.warning("No 'SL' column found in the main sheet -- 0 SL tab will be empty.")
+        return empty
+    if df_all.empty:
+        return empty
+
+    sl_numeric = coerce_sl(df_all[SL_COL])
+    zero_sl = df_all[sl_numeric == 0]
+
+    logger.info(
+        "0 SL: %d of %d row(s) have a numeric zero SL (%d blank/non-numeric).",
+        len(zero_sl), len(df_all), int(sl_numeric.isna().sum()),
+    )
+    if zero_sl.empty:
+        return empty
+
+    summary = (
+        zero_sl.groupby(["algo", "server"], dropna=False)["userid"]
+        .nunique()
+        .reset_index()
+        .rename(columns={"userid": ZERO_SL_COUNT_COL})
+    )
+    summary = attach_operator(summary, operator_lookup)
+    return summary[ZERO_SL_COLUMNS].sort_values(["algo", "server"]).reset_index(drop=True)
+
+
+# -----------------------------
+# FIX (CR) COLUMN PARSING
+# -----------------------------
+def coerce_fix_cr(df: pd.DataFrame) -> Tuple[pd.Series, pd.DataFrame]:
+    """
+    Coerce the raw FIX (CR) column into a clean numeric Series.
+
+    A cell is treated as:
+      - blank   -> account simply has no fixed allocation; skipped silently.
+      - invalid -> cell is populated but unusable (non-numeric text, zero,
+                   or negative). Excluded from the Fixed tab AND reported
+                   back so the caller can surface it as a data-entry issue.
+      - valid   -> positive number, kept.
+
+    Returns:
+        values:  float Series aligned to df.index, NaN for blank/invalid rows.
+        invalid: DataFrame of the offending rows (may be empty).
+    """
+    raw = df[FIX_CR_COL]
+    raw_str = raw.astype(str).str.strip()
+    is_blank = raw.isna() | raw_str.str.lower().isin(FIX_CR_BLANK_TOKENS)
+
+    numeric = pd.to_numeric(raw, errors="coerce")
+    is_invalid = ~is_blank & (numeric.isna() | (numeric <= 0))
+
+    invalid = df.loc[is_invalid, ["userid", "alias", "server", "algo"]].copy()
+    invalid["fix_cr_raw"] = raw_str[is_invalid]
+    invalid["reason"] = np.where(
+        numeric[is_invalid].isna(), "Non-numeric value", "Zero or negative value"
+    )
+
+    if not invalid.empty:
+        logger.warning(
+            "Ignoring %d row(s) with an unusable FIX (CR) value: %s",
+            len(invalid), invalid["userid"].tolist(),
+        )
+
+    return numeric.where(~is_invalid), invalid.reset_index(drop=True)
 
 
 # -----------------------------
 # FIXED TAB
 # -----------------------------
-def build_fixed_tab(df_all: pd.DataFrame) -> pd.DataFrame:
+def build_fixed_tab(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Returns rows from df_all that have a FIX remark.
+    Build the Fixed Allocation tab from the FIX (CR) column.
+
+    expected_allocation = FIX (CR) x FIX_CR_MULTIPLIER
+    (1 -> 100,000 | 1.6 -> 160,000 | 0.8 -> 80,000 | 3 -> 300,000)
+
+    Only rows with a positive FIX (CR) value participate. A blank cell means
+    the account is not on a fixed allocation and is skipped.
     Always excludes DLR ACC / NOT RUNNING / Z SERVER regardless of mode.
+
+    Returns:
+        fixed:   the Fixed tab rows.
+        invalid: rows whose FIX (CR) cell was populated but unusable.
     """
-    if "remark" not in df_all.columns:
-        logger.warning("No 'remark' column found in main sheet -- Fixed tab will be empty.")
-        return pd.DataFrame(
-            columns=["userid", "alias", "server", "algo", "remark",
-                     "expected_allocation", "actual_allocation", "status", "_match"]
+    empty_fixed = pd.DataFrame(columns=FIXED_TAB_COLUMNS)
+    empty_invalid = pd.DataFrame(columns=FIX_CR_INVALID_COLUMNS)
+
+    if FIX_CR_COL not in df_all.columns:
+        logger.warning(
+            "No 'FIX (CR)' column found in the main sheet -- Fixed tab will be empty."
         )
+        return empty_fixed, empty_invalid
+
     # Always exclude irrelevant server groups
     df = df_all[~df_all["server"].isin(FIXED_EXCLUDE_SERVERS)].copy()
-    df["expected_allocation"] = df["remark"].apply(parse_fix_allocation)
-    df = df[df["expected_allocation"].notna()].copy()
-    df["expected_allocation"] = np.floor(df["expected_allocation"])
+    if df.empty:
+        return empty_fixed, empty_invalid
+
+    df[FIX_CR_COL], invalid = coerce_fix_cr(df)
+    df = df[df[FIX_CR_COL].notna()].copy()
+    if df.empty:
+        logger.info("Fixed tab: no accounts with a FIX (CR) value.")
+        return empty_fixed, invalid
+
+    # round(), not floor(): floor on a binary-float product can land one
+    # rupee low (e.g. x.xx * 100000 -> ...999.9999). The expected amount is
+    # always a whole rupee figure, so rounding is the correct semantic.
+    df["expected_allocation"] = (df[FIX_CR_COL] * FIX_CR_MULTIPLIER).round(0)
     df["_match"] = df["expected_allocation"] == df["allocation"]
     df["status"] = df["_match"].map({True: "Match", False: "Mismatch"})
+
     result = df[[
-        "userid", "alias", "server", "algo",
-        "remark", "expected_allocation", "allocation", "status", "_match",
+        "userid", "alias", "server", "algo", FIX_CR_COL,
+        "expected_allocation", "allocation", "status", "_match",
     ]].rename(columns={"allocation": "actual_allocation"})
-    return result.reset_index(drop=True)
+
+    logger.info(
+        "Fixed tab: %d FIX account(s), %d mismatch(es), %d invalid FIX (CR) value(s).",
+        len(result), int((~result["_match"]).sum()), len(invalid),
+    )
+    return result.reset_index(drop=True), invalid
+
+
+def _format_fix_cr(value: float) -> str:
+    """Render FIX (CR) without noisy trailing zeros: 1.0 -> '1', 1.6 -> '1.6'."""
+    return "" if pd.isna(value) else f"{value:g}"
 
 
 def style_fixed_tab(df: pd.DataFrame):
@@ -378,9 +625,11 @@ def style_fixed_tab(df: pd.DataFrame):
         return ["background-color: #1b5e20; color: #e8f5e9"] * len(row)
 
     display = df.drop(columns=["_match"])
-    return display.style.apply(row_style, axis=1).format(
-        {"expected_allocation": "{:,.0f}", "actual_allocation": "{:,.0f}"}
-    )
+    return display.style.apply(row_style, axis=1).format({
+        FIX_CR_COL: _format_fix_cr,
+        "expected_allocation": "{:,.0f}",
+        "actual_allocation": "{:,.0f}",
+    })
 
 
 # -----------------------------
@@ -419,11 +668,14 @@ def to_excel(
     allocation: pd.DataFrame,
     not_found_summary: Optional[pd.DataFrame] = None,
     running_summary: Optional[pd.DataFrame] = None,
+    zero_sl: Optional[pd.DataFrame] = None,
 ) -> io.BytesIO:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         if running_summary is not None:
             running_summary.to_excel(writer, sheet_name="Summary", index=False)
+        if zero_sl is not None:
+            zero_sl.to_excel(writer, sheet_name="0 SL", index=False)
         diff.to_excel(writer, sheet_name="Difference", index=False)
         not_found.to_excel(writer, sheet_name="Not Found", index=False)
         if not_found_summary is not None:
@@ -543,6 +795,16 @@ if file_all and file_run:
     df_all = normalize_values(normalize_columns(df_all), is_running=False)
     df_run = normalize_values(normalize_columns(df_run), is_running=True)
 
+    if OPERATOR_COL not in df_all.columns:
+        st.warning(
+            "No **Operator Name** column found in the All Users sheet -- "
+            "the operator column will be blank in every table."
+        )
+    if SL_COL not in df_all.columns:
+        st.warning(
+            "No **SL** column found in the All Users sheet -- the 0 SL tab will be empty."
+        )
+
     # Raw running snapshot (as uploaded, before dedup / server exclusions) --
     # used for the Summary tab pivot.
     df_run_raw = df_run.copy()
@@ -574,16 +836,43 @@ if file_all and file_run:
     not_found_tab = get_not_found(df_all_clean, df_run_clean)
 
     # Fixed tab: mode-filtered df_all, but DLR ACC / NOT RUNNING stripped inside
-    fixed_tab = build_fixed_tab(df_all)
+    fixed_tab, fix_cr_invalid = build_fixed_tab(df_all)
 
     allocation_tab = build_allocation_tab(df_all_clean, mode)
 
     not_found_summary_tab = build_not_found_summary(not_found_tab)
     running_pivot_tab = build_running_pivot(df_all_mode_filtered, df_run_raw)
 
+    # --- OPERATOR ---
+    # The userid universe for the operator lookup and the 0 SL pivot is the
+    # All Users sheet as filtered by the active DTE mode.
+    operator_lookup = build_operator_lookup(df_all_mode_filtered)
+
+    zero_sl_tab = build_zero_sl_pivot(df_all_mode_filtered, operator_lookup)
+
+    # Append operator_name as the last column of every table. The Difference
+    # tab has no plain algo/server, so resolve it off the All Users side.
+    diff_tab = attach_operator(diff_tab, operator_lookup, "algo_all", "server_all")
+    not_found_tab = attach_operator(not_found_tab, operator_lookup)
+    extra_tab = attach_operator(extra_tab, operator_lookup)
+    duplicate_tab = attach_operator(duplicate_tab, operator_lookup)[
+        ["userid", "Found in", OPERATOR_COL]
+    ]
+    allocation_tab = attach_operator(allocation_tab, operator_lookup)
+    not_found_summary_tab = attach_operator(not_found_summary_tab, operator_lookup)
+    running_pivot_tab = attach_operator(running_pivot_tab, operator_lookup)
+
+    # Fixed tab keeps _match last so the styler can still find it.
+    if not fixed_tab.empty:
+        fixed_tab = attach_operator(fixed_tab, operator_lookup)
+        fixed_tab = fixed_tab[
+            [c for c in fixed_tab.columns if c != "_match"] + ["_match"]
+        ]
+    fix_cr_invalid = attach_operator(fix_cr_invalid, operator_lookup)
+
     # --- SUMMARY ---
     st.markdown(f"### Summary -- {mode}")
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
     m1.metric("Differences", len(diff_tab))
     m2.metric("Not Found", len(not_found_tab))
     m3.metric("Extra Accounts", len(extra_tab))
@@ -591,11 +880,14 @@ if file_all and file_run:
     m5.metric("FIX Accounts", len(fixed_tab))
     fixed_mismatches = int((~fixed_tab["_match"]).sum()) if not fixed_tab.empty else 0
     m6.metric("FIX Mismatches", fixed_mismatches)
+    zero_sl_accounts = int(zero_sl_tab[ZERO_SL_COUNT_COL].sum()) if not zero_sl_tab.empty else 0
+    m7.metric("0 SL Accounts", zero_sl_accounts)
     st.markdown("---")
 
     # --- TABS ---
-    tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["Summary", "Difference", "Not Found", "Extra", "Duplicate", "Fixed", "Allocation"]
+    tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+        ["Summary", "Difference", "Not Found", "Extra", "Duplicate",
+         "Fixed", "Allocation", "0 SL"]
     )
 
     with tab0:
@@ -637,11 +929,21 @@ if file_all and file_run:
     with tab5:
         st.subheader("Fixed Allocation Accounts")
         st.caption(
-            "Accounts with a FIX remark in the main sheet. "
-            "DLR ACC / NOT RUNNING servers are excluded. "
+            "Accounts with a value in the **FIX (CR)** column of the main sheet. "
+            f"Expected allocation = FIX (CR) x {FIX_CR_MULTIPLIER:,} "
+            "(1 -> 100,000 | 1.6 -> 160,000 | 0.8 -> 80,000). "
+            "DLR ACC / NOT RUNNING / Z SERVER are excluded. "
             f"Showing **{len(fixed_tab)}** FIX accounts "
             f"(**{fixed_mismatches}** mismatches) for **{mode}** mode."
         )
+
+        if not fix_cr_invalid.empty:
+            st.warning(
+                f"{len(fix_cr_invalid)} account(s) have an unusable **FIX (CR)** "
+                "value and were excluded from this tab. Please correct the sheet."
+            )
+            render_table(fix_cr_invalid)
+
         if fixed_tab.empty:
             st.info("No FIX accounts found for this mode.")
         else:
@@ -673,10 +975,35 @@ if file_all and file_run:
                     )
                 )
 
+    with tab7:
+        st.subheader(f"0 SL Accounts -- {mode}")
+        st.caption(
+            "Accounts running with **zero stop-loss**: distinct userid count per "
+            f"Algo / Server where the **SL** column is numerically 0, across the "
+            f"**{mode}** userid set. Blank SL cells mean 'no SL recorded' and are "
+            "**not** counted. All servers are included -- no exclusions applied here."
+        )
+        if zero_sl_tab.empty:
+            st.success("No accounts are running with 0 SL.")
+        else:
+            c1, c2 = st.columns(2)
+            c1.metric("0 SL Accounts", zero_sl_accounts)
+            c2.metric("Algo / Server Groups", len(zero_sl_tab))
+
+            def _style_zero_sl_row(row):
+                return ["background-color: #4a148c; color: #ffffff; font-weight: bold"] * len(row)
+
+            render_table(
+                zero_sl_tab.style.apply(_style_zero_sl_row, axis=1).format(
+                    {ZERO_SL_COUNT_COL: "{:,.0f}"}
+                )
+            )
+
     # --- DOWNLOAD ---
     excel_bytes = to_excel(
         diff_tab, not_found_tab, extra_tab, duplicate_tab, fixed_tab, allocation_tab,
         not_found_summary=not_found_summary_tab, running_summary=running_pivot_tab,
+        zero_sl=zero_sl_tab,
     )
     st.download_button(
         "Download Full Report",
