@@ -115,18 +115,22 @@ def test_rules_validation() -> None:
           str(rules["excluded_servers"]))
 
     pcts = {k: v.get("pct") for k, v in rules["subcategories"].items() if v["action"] == "check"}
-    check("CC/CCG at 100%", pcts["CC"] == 1.0 and pcts["CCG"] == 1.0)
-    check("CCV/MSS/MSV at 60%",
-          pcts["CCV"] == 0.6 and pcts["MSS"] == 0.6 and pcts["MSV"] == 0.6)
-    check("MSR/MSP/MSN at 20%",
-          pcts["MSR"] == 0.2 and pcts["MSP"] == 0.2 and pcts["MSN"] == 0.2)
+    check("CC/CCG at 100 (whole percent)", pcts["CC"] == 100 and pcts["CCG"] == 100)
+    check("CCV/MSS/MSV at 60",
+          pcts["CCV"] == 60 and pcts["MSS"] == 60 and pcts["MSV"] == 60)
+    check("MSR/MSP/MSN at 20",
+          pcts["MSR"] == 20 and pcts["MSP"] == 20 and pcts["MSN"] == 20)
     check("PVT/PGB/PPS/PRD excluded",
           all(rules["subcategories"][k]["action"] == "exclude"
               for k in ("PVT", "PGB", "PPS", "PRD")))
     check("JA is a jexception", rules["subcategories"]["JA"]["action"] == "jexception")
 
     bad_cases = {
-        "pct as 60 not 0.60": {"subcategories": {"CC": {"action": "check", "pct": 60}}},
+        "pct as 0.60 fraction, not 60": {
+            "subcategories": {"CC": {"action": "check", "pct": 0.60}}},
+        "pct above 100": {"subcategories": {"CC": {"action": "check", "pct": 160}}},
+        "negative pct": {"subcategories": {"CC": {"action": "check", "pct": -20}}},
+        "check with pct 0": {"subcategories": {"CC": {"action": "check", "pct": 0}}},
         "unknown action": {"subcategories": {"CC": {"action": "frobnicate"}}},
         "check without pct": {"subcategories": {"CC": {"action": "check"}}},
         "negative basis": {"rounding": {"basis": -1, "divisor": 100, "mode": "half_up"}},
@@ -267,7 +271,10 @@ def test_real_files() -> None:
               .isin(rules["excluded_servers"]).any())
 
         if not res.empty:
-            recomputed = round_to_basis(res[CAPITAL_COL] * res["pct"], 2_000_000, "half_up") / 100
+            # pct is a WHOLE percent (60 == 60%), so divide by 100 before use.
+            recomputed = round_to_basis(
+                res[CAPITAL_COL] * res["pct"] / 100.0, 2_000_000, "half_up"
+            ) / 100
             check(f"{mode}: expected_allocation reproducible from capital x pct",
                   bool((recomputed == res["expected_allocation"]).all()))
 
@@ -784,6 +791,146 @@ def test_fix_exception() -> None:
                   len(cons) == len(sc), f"{len(cons)} vs {len(sc)}")
 
 
+# ---------------------------------------------------------------------
+# 12. Editable rules: round-trip and save
+# ---------------------------------------------------------------------
+def test_rules_editor() -> None:
+    from allocation_check import (
+        EDITOR_METHOD, EDITOR_NOTE, EDITOR_PCT, EDITOR_SUBCATEGORY,
+        METHOD_LABEL_CAPITAL, METHOD_LABEL_JAINAM, editor_to_subcategories,
+        pct_fraction, rules_to_editor, save_rules,
+    )
+    print("\n12. Editable rules")
+    rules = load_rules()
+
+    check("100 -> 1.00 multiplier", pct_fraction(100) == 1.0)
+    check("60 -> 0.60 multiplier", pct_fraction(60) == 0.6)
+    check("20 -> 0.20 multiplier", pct_fraction(20) == 0.2)
+
+    ed = rules_to_editor(rules)
+    check("editor has one row per SubCategory", len(ed) == len(rules["subcategories"]))
+    check("editor shows whole percentages",
+          set(ed.loc[ed[EDITOR_SUBCATEGORY].isin(["CC", "CCV", "MSR"]), EDITOR_PCT])
+          == {100.0, 60.0, 20.0},
+          str(sorted(set(ed[EDITOR_PCT]))))
+    check("excluded SubCategories show 0",
+          float(ed.loc[ed[EDITOR_SUBCATEGORY] == "PVT", EDITOR_PCT].iloc[0]) == 0.0)
+    check("JA shows the Jainam method",
+          ed.loc[ed[EDITOR_SUBCATEGORY] == "JA", EDITOR_METHOD].iloc[0] == METHOD_LABEL_JAINAM)
+
+    # round-trip must be lossless
+    back = editor_to_subcategories(ed)
+    check("round-trip preserves every SubCategory",
+          set(back) == set(rules["subcategories"]),
+          f"{sorted(set(back) ^ set(rules['subcategories']))}")
+    check("round-trip preserves percentages",
+          all(back[k]["pct"] == rules["subcategories"][k]["pct"]
+              for k in back if back[k]["action"] == "check"))
+    check("round-trip preserves actions",
+          all(back[k]["action"] == rules["subcategories"][k]["action"] for k in back),
+          str({k: (back[k]["action"], rules["subcategories"][k]["action"])
+               for k in back if back[k]["action"] != rules["subcategories"][k]["action"]}))
+
+    # 0 means exclude
+    ed2 = ed.copy()
+    ed2.loc[ed2[EDITOR_SUBCATEGORY] == "MSR", EDITOR_PCT] = 0
+    out = editor_to_subcategories(ed2)
+    check("entering 0 turns a SubCategory into 'exclude'",
+          out["MSR"]["action"] == "exclude" and out["MSR"]["pct"] == 0,
+          str(out["MSR"]))
+
+    # changing a percentage flows through to the arithmetic
+    ed3 = ed.copy()
+    ed3.loc[ed3[EDITOR_SUBCATEGORY] == "MSR", EDITOR_PCT] = 50
+    out3 = editor_to_subcategories(ed3)
+    check("changing 20 -> 50 is stored as 50", out3["MSR"]["pct"] == 50)
+
+    # adding a brand-new SubCategory
+    ed4 = pd.concat([ed, pd.DataFrame([{
+        EDITOR_SUBCATEGORY: "newcat", EDITOR_PCT: 75,
+        EDITOR_METHOD: METHOD_LABEL_CAPITAL, EDITOR_NOTE: "added from UI",
+    }])], ignore_index=True)
+    out4 = editor_to_subcategories(ed4)
+    check("new SubCategory added and upper-cased",
+          "NEWCAT" in out4 and out4["NEWCAT"]["pct"] == 75, str(out4.get("NEWCAT")))
+
+    # blank rows from the editor are ignored, not turned into a category
+    ed5 = pd.concat([ed, pd.DataFrame([{
+        EDITOR_SUBCATEGORY: "", EDITOR_PCT: 50,
+        EDITOR_METHOD: METHOD_LABEL_CAPITAL, EDITOR_NOTE: "",
+    }])], ignore_index=True)
+    check("blank editor row ignored", len(editor_to_subcategories(ed5)) == len(ed))
+
+    # bad edits must be refused
+    bad = {
+        "0.6 instead of 60": 0.6,
+        "over 100": 150,
+        "negative": -5,
+        "blank": np.nan,
+    }
+    for label, val in bad.items():
+        tmp = ed.copy()
+        tmp.loc[tmp[EDITOR_SUBCATEGORY] == "CC", EDITOR_PCT] = val
+        try:
+            editor_to_subcategories(tmp)
+            check(f"rejects {label}", False, "accepted")
+        except AllocationRulesError:
+            check(f"rejects {label}", True)
+
+    dup = pd.concat([ed, ed.head(1)], ignore_index=True)
+    try:
+        editor_to_subcategories(dup)
+        check("rejects duplicate SubCategory", False)
+    except AllocationRulesError:
+        check("rejects duplicate SubCategory", True)
+
+    # --- saving: valid write round-trips, invalid never reaches disk ---
+    with tempfile.TemporaryDirectory() as tmpdir:
+        target = Path(tmpdir) / "rules.json"
+        target.write_text(json.dumps(rules), encoding="utf-8")
+
+        changed = json.loads(json.dumps(rules))
+        changed["subcategories"] = out3          # MSR at 50
+        save_rules(changed, str(target))
+        reloaded = load_rules(str(target))
+        check("saved rules reload with the new value",
+              reloaded["subcategories"]["MSR"]["pct"] == 50)
+        check("backup of the previous file was written",
+              target.with_suffix(".json.bak").exists())
+
+        before = target.read_text(encoding="utf-8")
+        broken = json.loads(json.dumps(rules))
+        broken["subcategories"]["CC"] = {"action": "check", "pct": 0.6}
+        try:
+            save_rules(broken, str(target))
+            check("invalid rules are refused before writing", False, "wrote to disk")
+        except AllocationRulesError:
+            check("invalid rules are refused before writing", True)
+        check("file on disk unchanged after a refused save",
+              target.read_text(encoding="utf-8") == before)
+        check("no stray .tmp file left behind",
+              not target.with_suffix(".json.tmp").exists())
+
+    # --- an edited percentage changes the expected allocation end to end ---
+    all_users = pd.DataFrame({
+        "userid": ["A1"], "alias": ["a"], "server": ["vs1"], "algo": [1],
+        "runningtype": ["POS"], "runningdays": ["DAILY"], "subcategory": ["MSR"],
+        "allocation": [1.0], "max_loss": [1.0], "fix_cr": [np.nan],
+        "operator_name": ["OP"],
+    })
+    running = pd.DataFrame({"userid": ["A1"], "capital": [10_000_000.0]})
+
+    t20 = build_allocation_check(all_users, running, "4DTE", rules)
+    r50 = json.loads(json.dumps(rules))
+    r50["subcategories"] = out3
+    t50 = build_allocation_check(all_users, running, "4DTE", r50)
+    e20 = float(t20["result"]["expected_allocation"].iloc[0])
+    e50 = float(t50["result"]["expected_allocation"].iloc[0])
+    check("20% of 1cr -> 20,000", e20 == 20_000.0, f"{e20:,.0f}")
+    check("50% of 1cr -> 60,000 (half-up on 20,00,000)", e50 == 60_000.0, f"{e50:,.0f}")
+    check("editing the percentage changes the expected allocation", e20 != e50)
+
+
 if __name__ == "__main__":
     test_worked_examples()
     test_rounding_modes()
@@ -796,6 +943,7 @@ if __name__ == "__main__":
     test_consolidated()
     test_jainam()
     test_fix_exception()
+    test_rules_editor()
 
     print("\n" + "=" * 60)
     if _failures:

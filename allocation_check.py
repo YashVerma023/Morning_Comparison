@@ -183,16 +183,29 @@ def _validate_rules(rules: dict, source: Path) -> None:
                 f"SubCategory '{name}' has action {action!r}; "
                 f"must be one of {sorted(VALID_ACTIONS)}."
             )
-        if action == "check":
-            pct = cfg.get("pct")
-            if not isinstance(pct, (int, float)):
+        if action in ("check", "exclude"):
+            pct = cfg.get("pct", 0 if action == "exclude" else None)
+            if not isinstance(pct, (int, float)) or isinstance(pct, bool):
                 raise AllocationRulesError(
-                    f"SubCategory '{name}' has action 'check' but pct is {pct!r}."
+                    f"SubCategory '{name}' has action '{action}' but pct is {pct!r}. "
+                    "pct must be a whole percent, e.g. 60 for 60%."
                 )
-            if not 0 < pct <= 1:
+            if pct < 0 or pct > 100:
                 raise AllocationRulesError(
-                    f"SubCategory '{name}' pct must be in (0, 1], got {pct!r}. "
-                    "Use 0.60 for 60%, not 60."
+                    f"SubCategory '{name}' pct must be between 0 and 100, got {pct!r}."
+                )
+            # A value between 0 and 1 is almost certainly a fraction written by
+            # mistake (0.6 meaning 60%), which would deploy 0.6% of capital.
+            if 0 < pct < 1:
+                raise AllocationRulesError(
+                    f"SubCategory '{name}' pct is {pct!r}, which reads as {pct}% of "
+                    f"capital. If you meant {pct * 100:g}%, write {pct * 100:g}. "
+                    "Percentages are whole numbers here."
+                )
+            if action == "check" and pct == 0:
+                raise AllocationRulesError(
+                    f"SubCategory '{name}' has action 'check' with pct 0. "
+                    "Use action 'exclude' for a 0% SubCategory."
                 )
 
     for mode_name, cfg in rules["dte_filters"].items():
@@ -248,18 +261,158 @@ def _validate_rules(rules: dict, source: Path) -> None:
                         )
 
 
+METHOD_LABEL_CAPITAL = "Capital %"
+METHOD_LABEL_JAINAM = "Jainam sheet"
+METHOD_LABELS = [METHOD_LABEL_CAPITAL, METHOD_LABEL_JAINAM]
+
+EDITOR_SUBCATEGORY = "SubCategory"
+EDITOR_PCT = "% of capital"
+EDITOR_METHOD = "Method"
+EDITOR_NOTE = "note"
+EDITOR_COLUMNS = [EDITOR_SUBCATEGORY, EDITOR_PCT, EDITOR_METHOD, EDITOR_NOTE]
+
+
+def pct_fraction(pct_percent: float) -> float:
+    """Whole percent (60) -> multiplier (0.60)."""
+    return float(pct_percent) / 100.0
+
+
 def rules_summary(rules: dict) -> pd.DataFrame:
     """Human-readable view of the active rules, for display in the UI."""
     rows = []
     for name, cfg in rules["subcategories"].items():
         pct = cfg.get("pct")
+        action = cfg["action"]
+        if action == "jexception":
+            shown = "-"
+        elif action == "exclude":
+            shown = "0% (excluded)"
+        else:
+            shown = f"{pct:g}%"
         rows.append({
             "SubCategory": name,
-            "action": cfg["action"],
-            "% of capital": f"{pct:.0%}" if pct is not None else "-",
+            "action": action,
+            "% of capital": shown,
             "note": cfg.get("reason", ""),
         })
     return pd.DataFrame(rows)
+
+
+def rules_to_editor(rules: dict) -> pd.DataFrame:
+    """
+    Rules -> editable table.
+
+    Percentages are shown as whole numbers: 100 means 100%, 0 means Exclude.
+    """
+    rows = []
+    for name, cfg in rules["subcategories"].items():
+        action = cfg["action"]
+        rows.append({
+            EDITOR_SUBCATEGORY: name,
+            EDITOR_PCT: 0 if action != "check" else float(cfg.get("pct", 0)),
+            EDITOR_METHOD: (
+                METHOD_LABEL_JAINAM if action == "jexception" else METHOD_LABEL_CAPITAL
+            ),
+            EDITOR_NOTE: cfg.get("reason", ""),
+        })
+    return pd.DataFrame(rows, columns=EDITOR_COLUMNS)
+
+
+def editor_to_subcategories(edited: pd.DataFrame) -> dict:
+    """
+    Editable table -> the subcategories block.
+
+    0 means Exclude. Any other value 1-100 is a percentage of running capital.
+    Raises AllocationRulesError on anything that cannot be interpreted, so a
+    bad edit is refused rather than silently changing what accounts are measured
+    against.
+    """
+    out: dict = {}
+    seen: set = set()
+
+    for i, row in edited.iterrows():
+        name = str(row.get(EDITOR_SUBCATEGORY, "")).strip().upper()
+        if not name or name in ("NAN", "NONE"):
+            continue  # blank row from the editor
+        if name in seen:
+            raise AllocationRulesError(f"SubCategory '{name}' appears more than once.")
+        seen.add(name)
+
+        method = str(row.get(EDITOR_METHOD, METHOD_LABEL_CAPITAL)).strip()
+        note = str(row.get(EDITOR_NOTE, "") or "").strip()
+
+        if method == METHOD_LABEL_JAINAM:
+            out[name] = {"action": "jexception",
+                         "reason": note or "Checked against the Jainam sheet"}
+            continue
+
+        raw = row.get(EDITOR_PCT)
+        if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+            raise AllocationRulesError(
+                f"SubCategory '{name}' has a blank percentage. "
+                "Enter 0 to exclude it, or 1-100 for a percentage."
+            )
+        try:
+            pct = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise AllocationRulesError(
+                f"SubCategory '{name}' percentage {raw!r} is not a number."
+            ) from exc
+
+        if pct < 0 or pct > 100:
+            raise AllocationRulesError(
+                f"SubCategory '{name}' percentage must be between 0 and 100, got {pct:g}."
+            )
+        if 0 < pct < 1:
+            raise AllocationRulesError(
+                f"SubCategory '{name}' percentage {pct:g} reads as {pct:g}% of capital. "
+                f"If you meant {pct * 100:g}%, enter {pct * 100:g}."
+            )
+
+        if pct == 0:
+            out[name] = {"action": "exclude", "pct": 0,
+                         "reason": note or "Excluded from expected-allocation calculation"}
+        else:
+            entry = {"action": "check", "pct": int(pct) if float(pct).is_integer() else pct}
+            if note:
+                entry["reason"] = note
+            out[name] = entry
+
+    if not out:
+        raise AllocationRulesError("At least one SubCategory must be defined.")
+    return out
+
+
+def save_rules(rules: dict, path: Optional[str] = None) -> Path:
+    """
+    Validate then write the rules JSON, keeping a backup of the previous file.
+
+    Validation runs BEFORE the write: an invalid edit must never reach disk,
+    or the next run would refuse to start.
+    """
+    rules_path = resolve_rules_path(path)
+    _validate_rules(rules, rules_path)
+
+    if rules_path.exists():
+        backup = rules_path.with_suffix(".json.bak")
+        try:
+            backup.write_text(rules_path.read_text(encoding="utf-8"), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Could not write rules backup: %s", exc)
+
+    tmp = rules_path.with_suffix(".json.tmp")
+    try:
+        rules_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(rules, fh, indent=2)
+            fh.write("\n")
+        tmp.replace(rules_path)   # atomic: never leaves a half-written rules file
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        raise AllocationRulesError(f"Could not write {rules_path}: {exc}") from exc
+
+    logger.info("Saved allocation rules to %s", rules_path)
+    return rules_path
 
 
 # -----------------------------
@@ -906,8 +1059,9 @@ def build_allocation_check(
     divisor = rules["rounding"]["divisor"]
     round_mode = rules["rounding"].get("mode", "half_up")
 
-    valid["pct"] = valid[SUBCATEGORY_COL].map(lambda s: sub_rules[s]["pct"])
-    valid["category_capital"] = valid[CAPITAL_COL] * valid["pct"]
+    # pct is a WHOLE percent in the rules file (60 == 60%).
+    valid["pct"] = valid[SUBCATEGORY_COL].map(lambda s: float(sub_rules[s]["pct"]))
+    valid["category_capital"] = valid[CAPITAL_COL] * valid["pct"].map(pct_fraction)
     valid["rounded_capital"] = round_to_basis(valid["category_capital"], basis, round_mode)
     valid["expected_allocation"] = valid["rounded_capital"] / divisor
     valid["actual_allocation"] = pd.to_numeric(valid["allocation"], errors="coerce")
@@ -946,7 +1100,7 @@ def build_summary(result: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
     grouped["mismatch"] = grouped["checked"] - grouped["match"]
-    grouped["pct"] = grouped["pct"].map(lambda p: f"{p:.0%}")
+    grouped["pct"] = grouped["pct"].map(lambda p: "" if pd.isna(p) else f"{p:g}%")
     return grouped.sort_values(SUBCATEGORY_COL).reset_index(drop=True)
 
 
@@ -985,7 +1139,7 @@ def build_consolidated(
     cap = tables.get("result", pd.DataFrame())
     if not cap.empty:
         part = base(cap)
-        part["rule"] = cap["pct"].map(lambda p: f"{p:.0%}" if pd.notna(p) else "")
+        part["rule"] = cap["pct"].map(lambda p: f"{p:g}%" if pd.notna(p) else "")
         part["allocation"] = cap["actual_allocation"]
         part["expected allocation"] = cap["expected_allocation"]
         part["category capital"] = cap["category_capital"]

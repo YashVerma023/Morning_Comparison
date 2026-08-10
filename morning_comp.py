@@ -1084,9 +1084,61 @@ def render_allocation_check(mode: str) -> None:
         f"{rules['rounding']['divisor']}."
     )
 
-    with st.expander("Active rules -- edit config/allocation_rules.json to change"):
-        render_table(ac.rules_summary(rules))
-        st.caption(f"Loaded from `{ac.resolve_rules_path()}` (version {rules.get('version')}).")
+    with st.expander("Active rules -- click to view and edit"):
+        st.caption(
+            "Enter a **whole percentage** of running capital: `100` = 100%, "
+            "`60` = 60%, **`0` = Exclude**. Set Method to *Jainam sheet* for "
+            "SubCategories checked against the Jainam sheet instead of capital. "
+            "Add or remove rows as needed, then Save."
+        )
+
+        editor_key = "rules_editor"
+        edited = st.data_editor(
+            ac.rules_to_editor(rules),
+            key=editor_key,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                ac.EDITOR_SUBCATEGORY: st.column_config.TextColumn(
+                    "SubCategory", help="Must match the SubCategory column in the sheet.",
+                    required=True, width="small",
+                ),
+                ac.EDITOR_PCT: st.column_config.NumberColumn(
+                    "% of capital", help="100 = 100%, 60 = 60%, 0 = Exclude.",
+                    min_value=0, max_value=100, step=1, format="%d", width="small",
+                ),
+                ac.EDITOR_METHOD: st.column_config.SelectboxColumn(
+                    "Method", options=ac.METHOD_LABELS,
+                    help="Capital % uses running capital. Jainam sheet checks against "
+                         "the Jainam tab of the All Users workbook.",
+                    width="medium",
+                ),
+                ac.EDITOR_NOTE: st.column_config.TextColumn("note", width="large"),
+            },
+        )
+
+        b1, b2, _ = st.columns([1, 1, 3])
+        if b1.button("Save rules", type="primary", key="save_rules"):
+            try:
+                updated = dict(rules)
+                updated["subcategories"] = ac.editor_to_subcategories(edited)
+                path = ac.save_rules(updated)
+                st.success(f"Rules saved to `{path}`. Re-running the check.")
+                st.rerun()
+            except ac.AllocationRulesError as exc:
+                st.error(f"Not saved -- {exc}")
+            except Exception as exc:  # noqa: BLE001 - must not lose the user's edits
+                st.error(f"Not saved -- unexpected error: {exc}")
+                logger.exception("Failed to save allocation rules")
+
+        if b2.button("Reload from file", key="reload_rules"):
+            st.rerun()
+
+        st.caption(
+            f"Loaded from `{ac.resolve_rules_path()}` (version {rules.get('version')}). "
+            "A backup of the previous file is kept as `allocation_rules.json.bak`."
+        )
 
     prev_req = ac.previous_day_requirement(mode, rules)
     show_prev = prev_req in (ac.PREV_REQUIRED, ac.PREV_OPTIONAL)
@@ -1279,7 +1331,7 @@ def render_allocation_check(mode: str) -> None:
                 st.success("No mismatches.")
             else:
                 render_table(view.style.apply(_style, axis=1).format({
-                    "pct": "{:.0%}",
+                    "pct": "{:g}%",
                     ac.CAPITAL_COL: "{:,.0f}",
                     "category_capital": "{:,.0f}",
                     "rounded_capital": "{:,.0f}",
