@@ -844,12 +844,36 @@ def apply_excel_indian_format(writer, sheet_name: str, df: pd.DataFrame) -> None
         logger.exception("Could not apply Indian number format to sheet %s", sheet_name)
 
 
+# -----------------------------
+# STREAMLIT WIDTH API COMPATIBILITY
+# -----------------------------
+# `use_container_width` is deprecated and removed after 2025-12-31, replaced by
+# width="stretch" / "content" (Streamlit >= 1.49). Version-guarded so the app
+# runs on both old and new Streamlit rather than breaking on one of them.
+def _streamlit_supports_width_api() -> bool:
+    try:
+        major, minor = (int(part) for part in st.__version__.split(".")[:2])
+    except (AttributeError, ValueError):
+        return False
+    return (major, minor) >= (1, 49)
+
+
+_USE_WIDTH_API = _streamlit_supports_width_api()
+
+
+def width_kwargs(stretch: bool = True) -> Dict:
+    """Width argument for st.dataframe / st.button / st.data_editor."""
+    if _USE_WIDTH_API:
+        return {"width": "stretch" if stretch else "content"}
+    return {"use_container_width": stretch}
+
+
 def render_table(df, hide_index: bool = True) -> None:
     """
     Render any table (plain DataFrame or a pandas Styler from .style.apply()
     / .format()) sized to its actual column count, instead of always
     stretching to the full page width. A 2-4 column table stretched with
-    use_container_width=True leaves a large, unprofessional empty gap on
+    a full-width stretch leaves a large, unprofessional empty gap on
     wide screens; a wide table (~9+ columns) genuinely needs the space.
     This scales the rendered width to fit the content either way.
     """
@@ -870,11 +894,11 @@ def render_table(df, hide_index: bool = True) -> None:
                 render_obj = df
 
     if width_fraction >= 0.98:
-        st.dataframe(render_obj, use_container_width=True, hide_index=hide_index)
+        st.dataframe(render_obj, hide_index=hide_index, **width_kwargs())
     else:
         col, _ = st.columns([width_fraction, 1 - width_fraction])
         with col:
-            st.dataframe(render_obj, use_container_width=True, hide_index=hide_index)
+            st.dataframe(render_obj, hide_index=hide_index, **width_kwargs())
 
 
 def render_login_check(mode: str) -> None:
@@ -1213,8 +1237,8 @@ def render_allocation_check(mode: str) -> None:
             ac.rules_to_editor(rules),
             key=editor_key,
             num_rows="dynamic",
-            use_container_width=True,
             hide_index=True,
+            **width_kwargs(),
             column_config={
                 ac.EDITOR_SUBCATEGORY: st.column_config.TextColumn(
                     "SubCategory", help="Must match the SubCategory column in the sheet.",
@@ -1335,7 +1359,7 @@ def render_allocation_check(mode: str) -> None:
     st.markdown("")
     run_col, hint_col = st.columns([1, 4])
     if run_col.button("Check", type="primary", key="alloc_check_btn",
-                      use_container_width=True):
+                      **width_kwargs()):
         st.session_state["alloc_ran"] = True
         st.session_state["alloc_signature"] = signature
     hint_col.caption(
