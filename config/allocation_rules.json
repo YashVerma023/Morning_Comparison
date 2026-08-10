@@ -85,12 +85,12 @@
     "CCG": { "action": "check", "pct": 100 },
 
     "CCV": { "action": "check", "pct": 60 },
-    "MSS": { "action": "check", "pct": 60 },
+    "MSS": { "action": "check", "pct": 40 },
     "MSV": { "action": "check", "pct": 60 },
 
-    "MSR": { "action": "check", "pct": 20 },
-    "MSP": { "action": "check", "pct": 20 },
-    "MSN": { "action": "check", "pct": 20 },
+    "MSR": { "action": "check", "pct": 40 },
+    "MSP": { "action": "check", "pct": 40 },
+    "MSN": { "action": "check", "pct": 40 },
 
     "PVT": { "action": "exclude", "pct": 0, "reason": "Excluded from expected-allocation calculation" },
     "PGB": { "action": "exclude", "pct": 0, "reason": "Excluded from expected-allocation calculation" },
