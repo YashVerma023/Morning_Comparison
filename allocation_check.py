@@ -171,6 +171,11 @@ def _validate_rules(rules: dict, source: Path) -> None:
     if not isinstance(rules["excluded_servers"], list):
         raise AllocationRulesError("excluded_servers must be a list.")
 
+    if "excluded_algos" in rules and not isinstance(rules["excluded_algos"], list):
+        raise AllocationRulesError(
+            f"excluded_algos must be a list, got {rules['excluded_algos']!r}."
+        )
+
     if not rules["subcategories"]:
         raise AllocationRulesError("subcategories is empty -- nothing would be checked.")
 
@@ -381,6 +386,38 @@ def editor_to_subcategories(edited: pd.DataFrame) -> dict:
     if not out:
         raise AllocationRulesError("At least one SubCategory must be defined.")
     return out
+
+
+def parse_excluded_algos(text: str) -> list:
+    """
+    Parse the UI's comma/space separated algo list.
+
+    "8, 19" -> [8, 19]. Numeric values are stored as numbers so the JSON stays
+    readable; anything non-numeric is kept verbatim and still matched.
+    """
+    if text is None:
+        return []
+    tokens = [t.strip() for t in str(text).replace("\n", ",").replace(" ", ",").split(",")]
+    out: list = []
+    seen: set = set()
+    for token in tokens:
+        if not token:
+            continue
+        key = algo_key(token)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        try:
+            number = float(token)
+            out.append(int(number) if number.is_integer() else number)
+        except ValueError:
+            out.append(token)
+    return out
+
+
+def format_excluded_algos(rules: dict) -> str:
+    """Excluded algos as an editable comma-separated string."""
+    return ", ".join(str(a) for a in (rules.get("excluded_algos") or []))
 
 
 def save_rules(rules: dict, path: Optional[str] = None) -> Path:
@@ -649,6 +686,64 @@ def build_previous_day_check(
         int((result["status"] == "Mismatch").sum()), len(new_accounts),
     )
     return result, new_accounts[PREVDAY_COLUMNS].reset_index(drop=True)
+
+
+# -----------------------------
+# EXCLUDED ALGOS
+# -----------------------------
+def algo_key(value) -> str:
+    """
+    Canonical form of an algo for comparison.
+
+    Algo arrives as int64 from Excel, int from CSV and sometimes text, so
+    1, 1.0 and "1" must all compare equal.
+    """
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    if not text:
+        return ""
+    try:
+        number = float(text)
+    except ValueError:
+        return text.upper()
+    return str(int(number)) if number.is_integer() else str(number)
+
+
+def excluded_algo_keys(rules: dict) -> set:
+    """Configured excluded algos, in canonical form."""
+    return {
+        key for key in (algo_key(a) for a in rules.get("excluded_algos", []) or [])
+        if key
+    }
+
+
+def split_excluded_algos(
+    df: pd.DataFrame, rules: dict
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Split a frame into (excluded_by_algo, rest).
+
+    Excluded algos stay in scope and are reported as 'Not under check' rather
+    than being dropped, so a skipped account is always visible.
+    """
+    keys = excluded_algo_keys(rules)
+    empty = df.iloc[0:0].copy()
+    if not keys or df.empty or "algo" not in df.columns:
+        return empty, df
+
+    mask = df["algo"].map(algo_key).isin(keys)
+    if mask.any():
+        logger.info(
+            "Excluded algos %s: %d account(s) skipped by every rule.",
+            sorted(keys), int(mask.sum()),
+        )
+    return df[mask].copy(), df[~mask].copy()
 
 
 # -----------------------------
@@ -949,6 +1044,7 @@ def build_allocation_check(
             "jainam_result": pd.DataFrame(columns=JAINAM_COLUMNS),
             "fix_result": pd.DataFrame(columns=FIX_COLUMNS),
             "fix_invalid": pd.DataFrame(columns=display_cols),
+            "excluded_algo": pd.DataFrame(columns=display_cols),
             "not_in_running": pd.DataFrame(columns=display_cols),
             "no_capital": pd.DataFrame(columns=display_cols),
             "prevday_result": pd.DataFrame(columns=PREVDAY_COLUMNS),
@@ -963,8 +1059,11 @@ def build_allocation_check(
         logger.warning("Allocation Check %s: no accounts in scope.", mode)
         return _tables()
 
-    # --- 0. FIX (CR) exception: highest precedence, overrides every other rule ---
-    fix_accounts, fix_invalid, remaining = split_fix_accounts(in_scope, rules)
+    # --- 0a. excluded algos: skipped by every rule, but kept visible ---
+    excluded_algo, after_algo = split_excluded_algos(in_scope, rules)
+
+    # --- 0b. FIX (CR) exception: overrides Jainam, capital and previous-day ---
+    fix_accounts, fix_invalid, remaining = split_fix_accounts(after_algo, rules)
     fix_result = build_fix_check(fix_accounts, rules)
 
     # --- 1. classify by SubCategory (JA is extracted before any routing) ---
@@ -1015,6 +1114,7 @@ def build_allocation_check(
             jainam_result=jainam_result,
             fix_result=fix_result,
             fix_invalid=_slice(fix_invalid),
+            excluded_algo=_slice(excluded_algo),
             not_in_running=_slice(not_in_running),
             no_capital=_slice(no_capital),
             prevday_result=prevday_result,
@@ -1210,6 +1310,7 @@ def build_consolidated(
 
     # --- everything in scope but not checked ---
     not_checked = [
+        ("excluded_algo", "Algo excluded by rule"),
         ("fix_invalid", "FIX (CR) value is unusable (0, negative or non-numeric)"),
         ("unknown_subcategory", "SubCategory not defined in the rules file"),
         ("excluded", "SubCategory excluded by rule"),
@@ -1277,6 +1378,7 @@ def reconcile(scoped_total: int, tables: Dict[str, pd.DataFrame]) -> Tuple[bool,
         + len(tables.get("jainam_result", []))
         + len(tables.get("fix_result", []))
         + len(tables.get("fix_invalid", []))
+        + len(tables.get("excluded_algo", []))
         + len(tables.get("unroutable", []))
     )
     ok = counted == scoped_total

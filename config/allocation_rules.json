@@ -28,6 +28,9 @@
   "excluded_servers": ["dlr acc", "not running"],
   "_excluded_servers_comment": "Matched case-insensitively against the All Users `server` column. These accounts are never checked in any DTE mode.",
 
+  "excluded_algos": [],
+  "_excluded_algos_comment": "Algos listed here are skipped by every Allocation Check rule. They remain IN SCOPE and appear in the All Accounts table with status 'Not under check' and the remark 'Algo excluded by rule', so nothing disappears silently. Values are compared numerically, so 8, 8.0 and \"8\" all match. This exclusion has the highest precedence -- it applies before the FIX, Jainam, capital and previous-day rules. Editable from the app's Allocation Check screen.",
+
   "dte_filters": {
     "0DTE": {
       "runningtype": null,

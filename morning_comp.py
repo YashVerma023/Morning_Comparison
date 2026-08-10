@@ -1234,11 +1234,25 @@ def render_allocation_check(mode: str) -> None:
             },
         )
 
+        st.markdown("**Excluded algos**")
+        algos_text = st.text_input(
+            "Algos to skip (comma separated)",
+            value=ac.format_excluded_algos(rules),
+            placeholder="e.g. 8, 19    (leave blank to check every algo)",
+            key="excluded_algos_input",
+            help=(
+                "Accounts on these algos are skipped by every rule -- FIX, Jainam, "
+                "capital and previous-day. They still appear in the All Accounts "
+                "table as 'Not under check' so nothing disappears silently."
+            ),
+        )
+
         b1, b2, _ = st.columns([1, 1, 3])
         if b1.button("Save rules", type="primary", key="save_rules"):
             try:
                 updated = dict(rules)
                 updated["subcategories"] = ac.editor_to_subcategories(edited)
+                updated["excluded_algos"] = ac.parse_excluded_algos(algos_text)
                 path = ac.save_rules(updated)
                 st.success(f"Rules saved to `{path}`. Re-running the check.")
                 st.rerun()
@@ -1377,6 +1391,13 @@ def render_allocation_check(mode: str) -> None:
     ok, msg = ac.reconcile(len(in_scope), tables)
     if not ok:
         st.error(f"Internal reconciliation failed -- {msg}. Do not trust these numbers.")
+
+    if rules.get("excluded_algos"):
+        st.info(
+            f"Algo(s) **{ac.format_excluded_algos(rules)}** are excluded by rule. "
+            f"{len(tables['excluded_algo'])} account(s) were skipped by every check "
+            "and appear as 'Not under check'."
+        )
 
     dup_ids = in_scope["userid"][in_scope["userid"].duplicated(keep=False)].unique()
     if len(dup_ids):
@@ -1649,6 +1670,17 @@ def render_allocation_check(mode: str) -> None:
         else:
             render_table(nc)
 
+        excl_algo = tables["excluded_algo"]
+        st.markdown(f"**Algo excluded by rule** -- {len(excl_algo)} account(s)")
+        st.caption(
+            f"Configured excluded algos: "
+            f"{ac.format_excluded_algos(rules) or '(none)'}"
+        )
+        if excl_algo.empty:
+            st.success("None.")
+        else:
+            render_table(excl_algo)
+
         unroutable = tables["unroutable"]
         st.markdown(f"**Cannot route to a check method** -- {len(unroutable)} account(s)")
         st.caption(
@@ -1696,10 +1728,12 @@ def render_allocation_check(mode: str) -> None:
             ("JExceptions", tables["jexceptions"]),
             ("Not In Running", tables["not_in_running"]),
             ("No Capital", tables["no_capital"]),
+            ("Excluded Algo", tables["excluded_algo"]),
             ("Cannot Route", tables["unroutable"]),
         ):
             if frame is not None and name in writer.sheets:
                 apply_excel_indian_format(writer, name, frame)
+        tables["excluded_algo"].to_excel(writer, sheet_name="Excluded Algo", index=False)
         tables["unroutable"].to_excel(writer, sheet_name="Cannot Route", index=False)
         tables["unknown_subcategory"].to_excel(writer, sheet_name="Unmapped SubCat", index=False)
         tables["excluded"].to_excel(writer, sheet_name="Excluded", index=False)
