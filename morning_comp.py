@@ -636,11 +636,9 @@ def style_fixed_tab(df: pd.DataFrame):
         return ["background-color: #1b5e20; color: #e8f5e9"] * len(row)
 
     display = df.drop(columns=["_match"])
-    return display.style.apply(row_style, axis=1).format({
-        FIX_CR_COL: _format_fix_cr,
-        "expected_allocation": "{:,.0f}",
-        "actual_allocation": "{:,.0f}",
-    })
+    return display.style.apply(row_style, axis=1).format(
+        indian_formats(display, {FIX_CR_COL: _format_fix_cr}), na_rep=""
+    )
 
 
 # -----------------------------
@@ -707,6 +705,16 @@ def to_excel(
 
         allocation.to_excel(writer, sheet_name="Allocation", index=False)
 
+        # Indian digit grouping on every money column of every sheet.
+        for name, frame in (
+            ("Summary", running_summary), ("0 SL", zero_sl), ("Difference", diff),
+            ("Not Found", not_found), ("Not Found Summary", not_found_summary),
+            ("Extra", extra), ("Duplicate", duplicate), ("Fixed", fixed_export),
+            ("Allocation", allocation),
+        ):
+            if frame is not None and name in writer.sheets:
+                apply_excel_indian_format(writer, name, frame)
+
     output.seek(0)
     return output
 
@@ -741,6 +749,101 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# -----------------------------
+# INDIAN NUMBER FORMAT
+# -----------------------------
+# Money is shown with lakh/crore grouping: 1,00,00,000 -- not 10,000,000.
+# The last three digits group together, everything above them in twos.
+MONEY_COLUMNS = {
+    "allocation", "maxloss", "max_loss", "capital",
+    "expected allocation", "category capital",
+    "expected_allocation", "actual_allocation", "category_capital",
+    "rounded_capital", "difference",
+    "previous_allocation", "today_allocation", "jainam_allocation",
+    "allocation_all", "allocation_run", "max_loss_all", "max_loss_run",
+}
+
+# Excel equivalent: three sections for crore / lakh / below-lakh.
+EXCEL_INDIAN_FORMAT = r'[>=10000000]##\,##\,##\,##0;[>=100000]##\,##\,##0;##,##0'
+
+
+def format_indian(value, decimals: int = 0) -> str:
+    """
+    Format a number with Indian digit grouping.
+
+        10000000  -> 1,00,00,000
+        400000    -> 4,00,000
+        40000     -> 40,000
+        -120000   -> -1,20,000
+
+    Blank for NaN/None so empty cells stay empty rather than reading '0'.
+    """
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        return str(value)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+    negative = number < 0
+    number = abs(number)
+
+    whole = int(number)
+    fraction = ""
+    if decimals:
+        fraction = f"{number - whole:.{decimals}f}"[1:]
+
+    digits = str(whole)
+    if len(digits) <= 3:
+        grouped = digits
+    else:
+        last3 = digits[-3:]
+        rest = digits[:-3]
+        pairs = []
+        while len(rest) > 2:
+            pairs.insert(0, rest[-2:])
+            rest = rest[:-2]
+        if rest:
+            pairs.insert(0, rest)
+        grouped = ",".join(pairs) + "," + last3
+
+    return f"{'-' if negative else ''}{grouped}{fraction}"
+
+
+def indian_formats(df, extra: Optional[Dict] = None) -> Dict:
+    """Formatter map applying Indian grouping to money columns of df."""
+    frame = df.data if hasattr(df, "data") else df
+    fmt = {
+        col: format_indian
+        for col in frame.columns
+        if str(col).strip().lower() in MONEY_COLUMNS
+    }
+    if extra:
+        fmt.update(extra)
+    return fmt
+
+
+def apply_excel_indian_format(writer, sheet_name: str, df: pd.DataFrame) -> None:
+    """Apply Indian number formatting to money columns of a written sheet."""
+    try:
+        book = writer.book
+        sheet = writer.sheets[sheet_name]
+        money = book.add_format({"num_format": EXCEL_INDIAN_FORMAT})
+        for idx, col in enumerate(df.columns):
+            width = max(12, min(28, len(str(col)) + 4))
+            if str(col).strip().lower() in MONEY_COLUMNS:
+                sheet.set_column(idx, idx, width, money)
+            else:
+                sheet.set_column(idx, idx, width)
+    except Exception:  # noqa: BLE001 - formatting must never break the export
+        logger.exception("Could not apply Indian number format to sheet %s", sheet_name)
+
+
 def render_table(df, hide_index: bool = True) -> None:
     """
     Render any table (plain DataFrame or a pandas Styler from .style.apply()
@@ -753,12 +856,25 @@ def render_table(df, hide_index: bool = True) -> None:
     underlying = df.data if hasattr(df, "data") else df
     n_cols = max(len(underlying.columns), 1)
     width_fraction = min(1.0, max(0.3, 0.12 + 0.10 * n_cols))
+
+    # Plain DataFrames get Indian money grouping automatically. Stylers arrive
+    # pre-formatted by their caller and are passed through untouched.
+    render_obj = df
+    if not hasattr(df, "data"):
+        fmt = indian_formats(df)
+        if fmt:
+            try:
+                render_obj = df.style.format(fmt, na_rep="")
+            except Exception:  # noqa: BLE001 - never block rendering on formatting
+                logger.exception("Could not apply Indian formatting")
+                render_obj = df
+
     if width_fraction >= 0.98:
-        st.dataframe(df, use_container_width=True, hide_index=hide_index)
+        st.dataframe(render_obj, use_container_width=True, hide_index=hide_index)
     else:
         col, _ = st.columns([width_fraction, 1 - width_fraction])
         with col:
-            st.dataframe(df, use_container_width=True, hide_index=hide_index)
+            st.dataframe(render_obj, use_container_width=True, hide_index=hide_index)
 
 
 def render_login_check(mode: str) -> None:
@@ -961,7 +1077,7 @@ def render_login_check(mode: str) -> None:
 
                     render_table(
                         allocation_tab.style.apply(_style_alloc_row, axis=1).format(
-                            {"allocation": "{:,.0f}"}
+                            indian_formats(allocation_tab), na_rep=""
                         )
                     )
 
@@ -1184,6 +1300,39 @@ def render_allocation_check(mode: str) -> None:
         )
         return
 
+    # --- Check button ---------------------------------------------------
+    # The result must survive later reruns (tab filters, checkboxes), so the
+    # click is latched in session state rather than read directly. The latch is
+    # keyed to the inputs: if the mode or any uploaded file changes, it clears
+    # itself so stale results can never be shown against different inputs.
+    def _file_sig(f) -> tuple:
+        if f is None:
+            return ()
+        return (getattr(f, "name", None), getattr(f, "size", None),
+                getattr(f, "file_id", None))
+
+    signature = (mode, _file_sig(file_all), _file_sig(file_run), _file_sig(file_prev))
+
+    if st.session_state.get("alloc_signature") != signature:
+        if st.session_state.get("alloc_ran"):
+            st.info("Inputs changed. Click **Check** to run again.")
+        st.session_state["alloc_ran"] = False
+
+    st.markdown("")
+    run_col, hint_col = st.columns([1, 4])
+    if run_col.button("Check", type="primary", key="alloc_check_btn",
+                      use_container_width=True):
+        st.session_state["alloc_ran"] = True
+        st.session_state["alloc_signature"] = signature
+    hint_col.caption(
+        f"Runs the Allocation Check on the uploaded files in **{mode}** mode."
+    )
+
+    if not st.session_state.get("alloc_ran"):
+        st.markdown("---")
+        st.caption("Ready. Click **Check** to run.")
+        return
+
     df_all = load_all_users_for_section(file_all)
     if df_all is None:
         return
@@ -1305,13 +1454,8 @@ def render_allocation_check(mode: str) -> None:
                 st.info("No rows for the selected status.")
             else:
                 st.caption(f"Showing {len(cview):,} of {len(consolidated):,} accounts.")
-                render_table(cview.style.apply(_cstyle, axis=1).format({
-                    "maxloss": "{:,.0f}",
-                    "allocation": "{:,.0f}",
-                    "expected allocation": "{:,.0f}",
-                    "category capital": "{:,.0f}",
-                    "capital": "{:,.0f}",
-                }, na_rep=""))
+                render_table(cview.style.apply(_cstyle, axis=1).format(
+                    indian_formats(cview), na_rep=""))
 
     with t0:
         st.subheader(f"Expected vs Actual Allocation -- {mode}")
@@ -1330,15 +1474,8 @@ def render_allocation_check(mode: str) -> None:
             if view.empty:
                 st.success("No mismatches.")
             else:
-                render_table(view.style.apply(_style, axis=1).format({
-                    "pct": "{:g}%",
-                    ac.CAPITAL_COL: "{:,.0f}",
-                    "category_capital": "{:,.0f}",
-                    "rounded_capital": "{:,.0f}",
-                    "expected_allocation": "{:,.0f}",
-                    "actual_allocation": "{:,.0f}",
-                    "difference": "{:,.0f}",
-                }))
+                render_table(view.style.apply(_style, axis=1).format(
+                    indian_formats(view, {"pct": "{:g}%"}), na_rep=""))
 
     with tp:
         st.subheader(f"Today vs Previous Day Allocation -- {mode}")
@@ -1376,11 +1513,8 @@ def render_allocation_check(mode: str) -> None:
                 if pview.empty:
                     st.success("No mismatches against the previous day.")
                 else:
-                    render_table(pview.style.apply(_pstyle, axis=1).format({
-                        "previous_allocation": "{:,.0f}",
-                        "today_allocation": "{:,.0f}",
-                        "difference": "{:,.0f}",
-                    }))
+                    render_table(pview.style.apply(_pstyle, axis=1).format(
+                        indian_formats(pview), na_rep=""))
 
             new_accts = tables["prevday_new"]
             st.markdown("---")
@@ -1417,12 +1551,8 @@ def render_allocation_check(mode: str) -> None:
                           if bad else "background-color: #1b5e20; color: #e8f5e9")
                 return [colour] * len(row)
 
-            render_table(jainam.style.apply(_jstyle, axis=1).format({
-                "jainam_allocation": "{:,.0f}",
-                "expected_allocation": "{:,.0f}",
-                "actual_allocation": "{:,.0f}",
-                "difference": "{:,.0f}",
-            }, na_rep=""))
+            render_table(jainam.style.apply(_jstyle, axis=1).format(
+                indian_formats(jainam), na_rep=""))
 
     with tf:
         fixed = tables["fix_result"]
@@ -1449,12 +1579,10 @@ def render_allocation_check(mode: str) -> None:
                           if bad else "background-color: #1b5e20; color: #e8f5e9")
                 return [colour] * len(row)
 
-            render_table(fixed.style.apply(_fstyle, axis=1).format({
-                "fix_cr": lambda v: "" if pd.isna(v) else f"{v:g}",
-                "expected_allocation": "{:,.0f}",
-                "actual_allocation": "{:,.0f}",
-                "difference": "{:,.0f}",
-            }, na_rep=""))
+            render_table(fixed.style.apply(_fstyle, axis=1).format(
+                indian_formats(fixed,
+                               {"fix_cr": lambda v: "" if pd.isna(v) else f"{v:g}"}),
+                na_rep=""))
 
         if not tables["fix_invalid"].empty:
             st.warning(
@@ -1548,6 +1676,30 @@ def render_allocation_check(mode: str) -> None:
         tables["jainam_result"].to_excel(writer, sheet_name="Jainam JA", index=False)
         tables["fix_result"].to_excel(writer, sheet_name="Fixed", index=False)
         tables["fix_invalid"].to_excel(writer, sheet_name="Fixed Invalid", index=False)
+
+        for name, frame in (
+            ("All Accounts", consolidated),
+            ("Summary", ac.build_summary(result)),
+            ("Capital Rule", result),
+            ("Capital Mismatches", result[result["status"] == "Mismatch"]
+                if not result.empty else None),
+            ("Previous Day", tables["prevday_result"]),
+            ("Prev Day Mismatches", tables["prevday_result"][
+                tables["prevday_result"]["status"] == "Mismatch"]
+                if not tables["prevday_result"].empty else None),
+            ("New Accounts", tables["prevday_new"]),
+            ("Jainam JA", tables["jainam_result"]),
+            ("Fixed", tables["fix_result"]),
+            ("Fixed Invalid", tables["fix_invalid"]),
+            ("Unmapped SubCat", tables["unknown_subcategory"]),
+            ("Excluded", tables["excluded"]),
+            ("JExceptions", tables["jexceptions"]),
+            ("Not In Running", tables["not_in_running"]),
+            ("No Capital", tables["no_capital"]),
+            ("Cannot Route", tables["unroutable"]),
+        ):
+            if frame is not None and name in writer.sheets:
+                apply_excel_indian_format(writer, name, frame)
         tables["unroutable"].to_excel(writer, sheet_name="Cannot Route", index=False)
         tables["unknown_subcategory"].to_excel(writer, sheet_name="Unmapped SubCat", index=False)
         tables["excluded"].to_excel(writer, sheet_name="Excluded", index=False)

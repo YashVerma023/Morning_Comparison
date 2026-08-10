@@ -3,3 +3,7 @@ pandas
 numpy
 openpyxl
 xlsxwriter
+# Required by pandas Styler, which drives the red/green row colouring and the
+# Indian number formatting. Pulled in transitively via streamlit -> altair, but
+# pandas 2.x needs >= 3.1.2 and an older resolve breaks every styled table.
+jinja2>=3.1.2
