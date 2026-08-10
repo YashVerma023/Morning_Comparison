@@ -1,10 +1,12 @@
 import io
 import logging
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+
+import allocation_check as ac
 
 # -----------------------------
 # LOGGING
@@ -58,6 +60,10 @@ MODE_FILTERS = {
 
 # Supported main-sheet names (case-insensitive)
 MAIN_SHEET_NAMES = {"main", "mfibain"}
+
+# App sections
+SECTION_LOGIN = "Login Check"
+SECTION_ALLOCATION = "Allocation Check"
 
 # -----------------------------
 # FIXED ALLOCATION
@@ -135,6 +141,11 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         # "Operator Name" -> "operatorname"
         "operatorname": OPERATOR_COL,
         "operator": OPERATOR_COL,
+        # Allocation Check inputs
+        "subcategory": "subcategory",
+        "sub_category": "subcategory",
+        "category": "category",
+        "capital": "capital",
     }
     return df.rename(columns=column_map)
 
@@ -750,263 +761,793 @@ def render_table(df, hide_index: bool = True) -> None:
             st.dataframe(df, use_container_width=True, hide_index=hide_index)
 
 
+def render_login_check(mode: str) -> None:
+    """Existing morning reconciliation: All Users vs Running Users."""
+    st.info(f"Running in **{mode}** mode. Change mode from the sidebar.")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        file_all = st.file_uploader("Upload All Users Excel", type=["xlsx"])
+    with col2:
+        file_run = st.file_uploader("Upload Running Users", type=["csv", "xlsx"])
+
+
+    if file_all and file_run:
+
+        st.success("Files uploaded successfully. Processing...")
+
+        df_all = load_all_users(file_all)
+        df_run = load_running_users(file_run)
+
+        if df_all is None:
+            st.stop()
+
+        df_all = normalize_values(normalize_columns(df_all), is_running=False)
+        df_run = normalize_values(normalize_columns(df_run), is_running=True)
+
+        if OPERATOR_COL not in df_all.columns:
+            st.warning(
+                "No **Operator Name** column found in the All Users sheet -- "
+                "the operator column will be blank in every table."
+            )
+        if SL_COL not in df_all.columns:
+            st.warning(
+                "No **SL** column found in the All Users sheet -- the 0 SL tab will be empty."
+            )
+
+        # Raw running snapshot (as uploaded, before dedup / server exclusions) --
+        # used for the Summary tab pivot.
+        df_run_raw = df_run.copy()
+
+        df_all = apply_mode_filter(df_all, mode)
+
+        # Snapshot right after the DTE mode filter only (no dedup / server
+        # exclusions yet) -- used for the Summary tab's "All user" count.
+        df_all_mode_filtered = df_all.copy()
+
+        dup_all = get_duplicates(df_all, "All User")
+        dup_run = get_duplicates(df_run, "Running")
+        duplicate_tab = pd.concat([dup_all, dup_run], ignore_index=True)
+
+        df_all = remove_duplicates(df_all)
+        df_run = remove_duplicates(df_run)
+
+        cfg = MODE_FILTERS[mode]
+        if cfg["apply_base_exclusions"]:
+            df_all_clean, extra_all = split_extra(df_all, EXCLUDE_ALL_USERS, "AllUser")
+            df_run_clean, extra_run = split_extra(df_run, EXCLUDE_RUNNING, "Running")
+            extra_tab = pd.concat([extra_all, extra_run], ignore_index=True)[COLS + ["not found in"]]
+        else:
+            df_all_clean = df_all
+            df_run_clean = df_run
+            extra_tab = pd.DataFrame(columns=COLS + ["not found in"])
+
+        diff_tab = get_difference(df_all_clean, df_run_clean)
+        not_found_tab = get_not_found(df_all_clean, df_run_clean)
+
+        # Fixed tab: mode-filtered df_all, but DLR ACC / NOT RUNNING stripped inside
+        fixed_tab, fix_cr_invalid = build_fixed_tab(df_all)
+
+        allocation_tab = build_allocation_tab(df_all_clean, mode)
+
+        not_found_summary_tab = build_not_found_summary(not_found_tab)
+        running_pivot_tab = build_running_pivot(df_all_mode_filtered, df_run_raw)
+
+        # --- OPERATOR ---
+        # The userid universe for the operator lookup and the 0 SL pivot is the
+        # All Users sheet as filtered by the active DTE mode.
+        operator_lookup = build_operator_lookup(df_all_mode_filtered)
+
+        zero_sl_tab = build_zero_sl_pivot(df_all_mode_filtered, operator_lookup)
+
+        # Append operator_name as the last column of every table. The Difference
+        # tab has no plain algo/server, so resolve it off the All Users side.
+        diff_tab = attach_operator(diff_tab, operator_lookup, "algo_all", "server_all")
+        not_found_tab = attach_operator(not_found_tab, operator_lookup)
+        extra_tab = attach_operator(extra_tab, operator_lookup)
+        duplicate_tab = attach_operator(duplicate_tab, operator_lookup)[
+            ["userid", "Found in", OPERATOR_COL]
+        ]
+        allocation_tab = attach_operator(allocation_tab, operator_lookup)
+        not_found_summary_tab = attach_operator(not_found_summary_tab, operator_lookup)
+        running_pivot_tab = attach_operator(running_pivot_tab, operator_lookup)
+
+        # Fixed tab keeps _match last so the styler can still find it.
+        if not fixed_tab.empty:
+            fixed_tab = attach_operator(fixed_tab, operator_lookup)
+            fixed_tab = fixed_tab[
+                [c for c in fixed_tab.columns if c != "_match"] + ["_match"]
+            ]
+        fix_cr_invalid = attach_operator(fix_cr_invalid, operator_lookup)
+
+        # --- SUMMARY ---
+        st.markdown(f"### Summary -- {mode}")
+        m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+        m1.metric("Differences", len(diff_tab))
+        m2.metric("Not Found", len(not_found_tab))
+        m3.metric("Extra Accounts", len(extra_tab))
+        m4.metric("Duplicates", len(duplicate_tab))
+        m5.metric("FIX Accounts", len(fixed_tab))
+        fixed_mismatches = int((~fixed_tab["_match"]).sum()) if not fixed_tab.empty else 0
+        m6.metric("FIX Mismatches", fixed_mismatches)
+        zero_sl_accounts = int(zero_sl_tab[ZERO_SL_COUNT_COL].sum()) if not zero_sl_tab.empty else 0
+        m7.metric("0 SL Accounts", zero_sl_accounts)
+        st.markdown("---")
+
+        # --- TABS ---
+        tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+            ["Summary", "Difference", "Not Found", "Extra", "Duplicate",
+             "Fixed", "Allocation", "0 SL"]
+        )
+
+        with tab0:
+            st.subheader(f"Running Users Pivot -- {mode}")
+            st.caption(
+                "Distinct userid count per Algo / Server. **All user** = from the "
+                f"All Users sheet filtered only by the **{mode}** RunningType/RunningDays "
+                "rule (no dedup / server exclusions applied here). **Running** = from "
+                "the Running Users sheet exactly as uploaded (before dedup / server exclusions)."
+            )
+            if running_pivot_tab.empty:
+                st.info("No data available to summarize.")
+            else:
+                render_table(running_pivot_tab)
+
+        with tab1:
+            st.subheader("Differences Between Sheets")
+            render_table(diff_tab)
+
+        with tab2:
+            st.subheader("Missing Users")
+            render_table(not_found_tab)
+
+            st.markdown("---")
+            st.subheader("Missing Users -- Summary by Algo / Server")
+            if not_found_summary_tab.empty:
+                st.info("No missing users to summarize.")
+            else:
+                render_table(not_found_summary_tab)
+
+        with tab3:
+            st.subheader("Excluded / Extra Accounts")
+            render_table(extra_tab)
+
+        with tab4:
+            st.subheader("Duplicate User IDs")
+            render_table(duplicate_tab)
+
+        with tab5:
+            st.subheader("Fixed Allocation Accounts")
+            st.caption(
+                "Accounts with a value in the **FIX (CR)** column of the main sheet. "
+                f"Expected allocation = FIX (CR) x {FIX_CR_MULTIPLIER:,} "
+                "(1 -> 100,000 | 1.6 -> 160,000 | 0.8 -> 80,000). "
+                "DLR ACC / NOT RUNNING / Z SERVER are excluded. "
+                f"Showing **{len(fixed_tab)}** FIX accounts "
+                f"(**{fixed_mismatches}** mismatches) for **{mode}** mode."
+            )
+
+            if not fix_cr_invalid.empty:
+                st.warning(
+                    f"{len(fix_cr_invalid)} account(s) have an unusable **FIX (CR)** "
+                    "value and were excluded from this tab. Please correct the sheet."
+                )
+                render_table(fix_cr_invalid)
+
+            if fixed_tab.empty:
+                st.info("No FIX accounts found for this mode.")
+            else:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Total FIX Accounts", len(fixed_tab))
+                c2.metric("Matching", int(fixed_tab["_match"].sum()))
+                c3.metric("Mismatched", fixed_mismatches)
+                render_table(style_fixed_tab(fixed_tab))
+
+        with tab6:
+            threshold = ALLOC_THRESHOLD.get(mode)
+            if threshold is None:
+                st.info("Allocation check is not applicable for 0DTE mode.")
+            else:
+                st.subheader(f"Low Allocation Accounts -- {mode}")
+                st.caption(
+                    f"Accounts with allocation > 0 and < {threshold:,} in {mode} mode. "
+                    f"Found {len(allocation_tab)} account(s)."
+                )
+                if allocation_tab.empty:
+                    st.success(f"All accounts meet the {threshold:,} allocation threshold.")
+                else:
+                    def _style_alloc_row(row):
+                        return ["background-color: #e65100; color: #ffffff; font-weight: bold"] * len(row)
+
+                    render_table(
+                        allocation_tab.style.apply(_style_alloc_row, axis=1).format(
+                            {"allocation": "{:,.0f}"}
+                        )
+                    )
+
+        with tab7:
+            st.subheader(f"0 SL Accounts -- {mode}")
+            st.caption(
+                "Accounts running with **zero stop-loss**: distinct userid count per "
+                f"Algo / Server where the **SL** column is numerically 0, across the "
+                f"**{mode}** userid set. Blank SL cells mean 'no SL recorded' and are "
+                "**not** counted. All servers are included -- no exclusions applied here."
+            )
+            if zero_sl_tab.empty:
+                st.success("No accounts are running with 0 SL.")
+            else:
+                c1, c2 = st.columns(2)
+                c1.metric("0 SL Accounts", zero_sl_accounts)
+                c2.metric("Algo / Server Groups", len(zero_sl_tab))
+
+                def _style_zero_sl_row(row):
+                    return ["background-color: #4a148c; color: #ffffff; font-weight: bold"] * len(row)
+
+                render_table(
+                    zero_sl_tab.style.apply(_style_zero_sl_row, axis=1).format(
+                        {ZERO_SL_COUNT_COL: "{:,.0f}"}
+                    )
+                )
+
+        # --- DOWNLOAD ---
+        excel_bytes = to_excel(
+            diff_tab, not_found_tab, extra_tab, duplicate_tab, fixed_tab, allocation_tab,
+            not_found_summary=not_found_summary_tab, running_summary=running_pivot_tab,
+            zero_sl=zero_sl_tab,
+        )
+        st.download_button(
+            "Download Full Report",
+            data=excel_bytes,
+            file_name=f"user_comparison_{mode}.xlsx",
+        )
+
+
+# -----------------------------
+# ALLOCATION CHECK SECTION
+# -----------------------------
+def load_all_users_for_section(file) -> Optional[pd.DataFrame]:
+    """Load + normalize the All Users Main sheet. Returns None on failure."""
+    raw = load_all_users(file)
+    if raw is None:
+        return None
+    return normalize_values(normalize_columns(raw), is_running=False)
+
+
+def load_jainam_sheet(file, rules: dict) -> Optional[pd.DataFrame]:
+    """
+    Read the Jainam sheet from the SAME All Users workbook.
+
+    Returns None if the sheet is absent -- JA accounts are then reported as
+    mismatches with an explanatory remark rather than silently skipped.
+    """
+    sheet_name = ac.jainam_config(rules)["sheet_name"]
+    try:
+        excel = pd.ExcelFile(file)
+        actual = next(
+            (s for s in excel.sheet_names if s.strip().lower() == sheet_name.strip().lower()),
+            None,
+        )
+        if actual is None:
+            logger.warning("No '%s' sheet in the All Users workbook.", sheet_name)
+            return None
+        return pd.read_excel(excel, sheet_name=actual)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user
+        st.warning(f"Could not read the '{sheet_name}' sheet: {exc}")
+        logger.exception("Failed to read the Jainam sheet")
+        return None
+
+
+def load_running_for_allocation(file) -> Optional[pd.DataFrame]:
+    """
+    Load the Running file for the Allocation Check.
+
+    Only userid and capital are needed. capital must NOT go through
+    normalize_values(), which divides allocation by 100 -- that scaling does
+    not apply to capital.
+    """
+    try:
+        raw = pd.read_csv(file) if file.name.lower().endswith(".csv") else pd.read_excel(file)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user
+        st.error(f"Failed to read the Running Users file: {exc}")
+        logger.exception("Failed to read running file for Allocation Check")
+        return None
+
+    df = normalize_columns(raw)
+    if "userid" not in df.columns:
+        st.error("Running Users file has no 'userId' column.")
+        return None
+    if ac.CAPITAL_COL not in df.columns:
+        st.error(
+            "Running Users file has no **capital** column, which the Allocation "
+            f"Check requires. Columns found: {sorted(df.columns)[:15]}"
+        )
+        return None
+
+    df["userid"] = (
+        df["userid"].astype(str).str.strip().str.replace(" ", "", regex=False).str.upper()
+    )
+    return df
+
+
+def render_allocation_check(mode: str) -> None:
+    """Expected trading allocation from running capital vs the All Users sheet."""
+    try:
+        rules = ac.load_rules()
+    except ac.AllocationRulesError as exc:
+        st.error(f"Allocation rules could not be loaded:\n\n{exc}")
+        st.info(f"Expected at: `{ac.resolve_rules_path()}`")
+        return
+
+    st.info(
+        f"Running in **{mode}** mode. Expected allocation = round-half-up("
+        f"capital x SubCategory %, {rules['rounding']['basis']:,}) / "
+        f"{rules['rounding']['divisor']}."
+    )
+
+    with st.expander("Active rules -- edit config/allocation_rules.json to change"):
+        render_table(ac.rules_summary(rules))
+        st.caption(f"Loaded from `{ac.resolve_rules_path()}` (version {rules.get('version')}).")
+
+    prev_req = ac.previous_day_requirement(mode, rules)
+    show_prev = prev_req in (ac.PREV_REQUIRED, ac.PREV_OPTIONAL)
+
+    cols = st.columns(3 if show_prev else 2)
+    with cols[0]:
+        file_all = st.file_uploader("Upload Today's All Users Excel", type=["xlsx"],
+                                    key="alloc_all")
+    with cols[1]:
+        file_run = st.file_uploader("Upload Running Users", type=["csv", "xlsx"],
+                                    key="alloc_run")
+    file_prev = None
+    if show_prev:
+        with cols[2]:
+            label = (
+                "Upload Previous Day All Users (required)"
+                if prev_req == ac.PREV_REQUIRED
+                else "Upload Previous Day All Users (optional)"
+            )
+            file_prev = st.file_uploader(label, type=["xlsx"], key="alloc_prev")
+
+    if prev_req == ac.PREV_REQUIRED:
+        st.caption(
+            f"**{mode}** requires all three files. INT accounts are checked against "
+            "running capital; POS accounts are checked against the previous day's allocation."
+        )
+    elif prev_req == ac.PREV_OPTIONAL:
+        st.caption(
+            f"**{mode}**: without the previous-day sheet every account is checked "
+            "against running capital. With it, POS + DAILY accounts are instead "
+            "checked against the previous day's allocation."
+        )
+
+    if not (file_all and file_run):
+        st.caption("Upload the required files to run the check.")
+        return
+
+    if prev_req == ac.PREV_REQUIRED and file_prev is None:
+        st.error(
+            f"**{mode} mode requires the previous day's All Users sheet.** "
+            "POS accounts are checked against the previous day's allocation, so "
+            "the check cannot run without it. Upload all three files."
+        )
+        return
+
+    df_all = load_all_users_for_section(file_all)
+    if df_all is None:
+        return
+    df_run = load_running_for_allocation(file_run)
+    if df_run is None:
+        return
+
+    df_prev = None
+    if file_prev is not None:
+        df_prev = load_all_users_for_section(file_prev)
+        if df_prev is None:
+            st.error("Could not read the previous-day All Users sheet.")
+            return
+        st.success(
+            f"Previous-day sheet loaded ({len(df_prev)} rows). "
+            "POS accounts will be checked against it."
+        )
+
+    df_jainam = load_jainam_sheet(file_all, rules)
+    jainam_sheet_name = ac.jainam_config(rules)["sheet_name"]
+
+    try:
+        tables = ac.build_allocation_check(
+            df_all, df_run, mode, rules, df_prev=df_prev, df_jainam=df_jainam
+        )
+        in_scope, _ = ac.apply_dte_scope(df_all, mode, rules)
+    except ac.AllocationRulesError as exc:
+        st.error(str(exc))
+        return
+
+    if df_jainam is None and not tables["jexceptions"].empty:
+        st.warning(
+            f"{len(tables['jexceptions'])} JA account(s) in scope but no "
+            f"**{jainam_sheet_name}** sheet was found in the All Users workbook. "
+            "They are reported as mismatches."
+        )
+
+    result = tables["result"]
+    n_match = int((result["status"] == "Match").sum()) if not result.empty else 0
+    n_mismatch = len(result) - n_match
+
+    ok, msg = ac.reconcile(len(in_scope), tables)
+    if not ok:
+        st.error(f"Internal reconciliation failed -- {msg}. Do not trust these numbers.")
+
+    dup_ids = in_scope["userid"][in_scope["userid"].duplicated(keep=False)].unique()
+    if len(dup_ids):
+        st.warning(
+            f"{len(dup_ids)} userid(s) appear more than once in the in-scope All "
+            f"Users rows: {', '.join(map(str, dup_ids[:10]))}"
+            f"{' ...' if len(dup_ids) > 10 else ''}. Each occurrence is checked "
+            "separately, so they appear as repeated rows below."
+        )
+
+    prevday = tables["prevday_result"]
+    p_match = int((prevday["status"] == "Match").sum()) if not prevday.empty else 0
+    p_mismatch = len(prevday) - p_match
+
+    st.markdown(f"### Allocation Check Summary -- {mode}")
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("In Scope", len(in_scope))
+    m2.metric("Capital Rule", len(result), delta=f"{n_mismatch} mismatch" if n_mismatch else None,
+              delta_color="inverse")
+    m3.metric("Capital Match", n_match)
+    m4.metric("Prev-Day Rule", len(prevday),
+              delta=f"{p_mismatch} mismatch" if p_mismatch else None, delta_color="inverse")
+    m5.metric("Prev-Day Match", p_match)
+    m6.metric("Unmapped SubCat", len(tables["unknown_subcategory"]))
+    st.caption(msg)
+    st.markdown("---")
+
+    consolidated = ac.build_consolidated(tables, in_scope)
+
+    tc, t0, tp, tj, tf, t1, t2, t3 = st.tabs(
+        ["All Accounts", "Capital Rule", "Previous Day", "Jainam (JA)", "Fixed",
+         "By SubCategory", "Unmapped / Excluded", "Not Checked"]
+    )
+
+    with tc:
+        st.subheader(f"All In-Scope Accounts -- {mode}")
+        st.caption(
+            "One row per in-scope account across both check methods. "
+            "**rule** is the percentage for capital-rule accounts, 'Previous Day' "
+            "for previous-day accounts. **expected allocation** is whichever value "
+            "the account was measured against. **category capital** and **capital** "
+            "apply only to capital-rule rows."
+        )
+        if consolidated.empty:
+            st.info("No accounts in scope for this mode.")
+        else:
+            counts = ac.consolidated_status_counts(consolidated)
+            cols = st.columns(max(len(counts), 1))
+            for col, (_, r) in zip(cols, counts.iterrows()):
+                col.metric(r["status"], int(r["accounts"]))
+
+            status_filter = st.multiselect(
+                "Filter by status",
+                options=list(counts["status"]),
+                default=[s for s in (ac.STATUS_MISMATCH, ac.STATUS_NEW_USER)
+                         if s in set(counts["status"])] or list(counts["status"]),
+                key="cons_filter",
+            )
+            cview = (
+                consolidated[consolidated["status"].isin(status_filter)]
+                if status_filter else consolidated
+            )
+
+            _palette = {
+                ac.STATUS_MISMATCH: "background-color: #b71c1c; color: #ffffff",
+                ac.STATUS_MATCH: "background-color: #1b5e20; color: #e8f5e9",
+                ac.STATUS_NEW_USER: "background-color: #0d47a1; color: #e3f2fd",
+                ac.STATUS_NOT_CHECKED: "background-color: #424242; color: #eeeeee",
+            }
+
+            def _cstyle(row):
+                return [_palette.get(cview.at[row.name, "status"], "")] * len(row)
+
+            if cview.empty:
+                st.info("No rows for the selected status.")
+            else:
+                st.caption(f"Showing {len(cview):,} of {len(consolidated):,} accounts.")
+                render_table(cview.style.apply(_cstyle, axis=1).format({
+                    "maxloss": "{:,.0f}",
+                    "allocation": "{:,.0f}",
+                    "expected allocation": "{:,.0f}",
+                    "category capital": "{:,.0f}",
+                    "capital": "{:,.0f}",
+                }, na_rep=""))
+
+    with t0:
+        st.subheader(f"Expected vs Actual Allocation -- {mode}")
+        if result.empty:
+            st.info("No accounts to check in this mode.")
+        else:
+            only_mismatch = st.checkbox("Show mismatches only", value=True)
+            view = result[result["status"] == "Mismatch"] if only_mismatch else result
+
+            def _style(row):
+                bad = view.at[row.name, "status"] == "Mismatch"
+                colour = ("background-color: #b71c1c; color: #ffffff"
+                          if bad else "background-color: #1b5e20; color: #e8f5e9")
+                return [colour] * len(row)
+
+            if view.empty:
+                st.success("No mismatches.")
+            else:
+                render_table(view.style.apply(_style, axis=1).format({
+                    "pct": "{:.0%}",
+                    ac.CAPITAL_COL: "{:,.0f}",
+                    "category_capital": "{:,.0f}",
+                    "rounded_capital": "{:,.0f}",
+                    "expected_allocation": "{:,.0f}",
+                    "actual_allocation": "{:,.0f}",
+                    "difference": "{:,.0f}",
+                }))
+
+    with tp:
+        st.subheader(f"Today vs Previous Day Allocation -- {mode}")
+        st.caption(
+            "A straight allocation-vs-allocation comparison against the previous "
+            "day's All Users sheet. SubCategory percentages and running capital "
+            "play no part here -- the two allocations must simply be equal."
+        )
+        if prevday.empty and tables["prevday_new"].empty:
+            if not show_prev:
+                st.info(f"The previous-day check does not apply in {mode} mode.")
+            elif df_prev is None:
+                st.info(
+                    "No previous-day sheet uploaded, so every account was checked "
+                    "against running capital instead."
+                )
+            else:
+                st.info("No accounts routed to the previous-day check in this mode.")
+        else:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Compared", len(prevday))
+            c2.metric("Match", p_match)
+            c3.metric("Mismatch", p_mismatch)
+
+            if not prevday.empty:
+                only_mm = st.checkbox("Show mismatches only", value=True, key="prev_mm")
+                pview = prevday[prevday["status"] == "Mismatch"] if only_mm else prevday
+
+                def _pstyle(row):
+                    bad = pview.at[row.name, "status"] == "Mismatch"
+                    colour = ("background-color: #b71c1c; color: #ffffff"
+                              if bad else "background-color: #1b5e20; color: #e8f5e9")
+                    return [colour] * len(row)
+
+                if pview.empty:
+                    st.success("No mismatches against the previous day.")
+                else:
+                    render_table(pview.style.apply(_pstyle, axis=1).format({
+                        "previous_allocation": "{:,.0f}",
+                        "today_allocation": "{:,.0f}",
+                        "difference": "{:,.0f}",
+                    }))
+
+            new_accts = tables["prevday_new"]
+            st.markdown("---")
+            st.markdown(f"**New accounts -- not in the previous-day sheet** ({len(new_accts)})")
+            st.caption("Reported separately, not counted as mismatches.")
+            if new_accts.empty:
+                st.success("None.")
+            else:
+                render_table(new_accts.drop(columns=["previous_allocation", "difference"]))
+
+    with tj:
+        jainam = tables["jainam_result"]
+        st.subheader(f"JA Accounts vs the {jainam_sheet_name} Sheet")
+        st.caption(
+            f"SubCategory **JA** accounts are checked against the **{jainam_sheet_name}** "
+            "sheet inside the same All Users workbook, not against running capital. "
+            f"Expected allocation = `ALLOCATION x {ac.jainam_config(rules)['multiplier']:,}` "
+            "(4 -> 4,00,000). An ALLOCATION of 0 means the expected allocation IS zero. "
+            "All rows are used regardless of Date; the sheet's Total row is dropped. "
+            "This check overrides the mode routing."
+        )
+        if jainam.empty:
+            st.info("No JA accounts in scope for this mode.")
+        else:
+            j_match = int((jainam["status"] == ac.STATUS_MATCH).sum())
+            j1, j2, j3 = st.columns(3)
+            j1.metric("JA Accounts", len(jainam))
+            j2.metric("Match", j_match)
+            j3.metric("Mismatch", len(jainam) - j_match)
+
+            def _jstyle(row):
+                bad = jainam.at[row.name, "status"] != ac.STATUS_MATCH
+                colour = ("background-color: #b71c1c; color: #ffffff"
+                          if bad else "background-color: #1b5e20; color: #e8f5e9")
+                return [colour] * len(row)
+
+            render_table(jainam.style.apply(_jstyle, axis=1).format({
+                "jainam_allocation": "{:,.0f}",
+                "expected_allocation": "{:,.0f}",
+                "actual_allocation": "{:,.0f}",
+                "difference": "{:,.0f}",
+            }, na_rep=""))
+
+    with tf:
+        fixed = tables["fix_result"]
+        fix_mult = ac.fix_config(rules)["multiplier"]
+        st.subheader(f"Fixed Allocation Accounts -- {mode}")
+        st.caption(
+            f"Accounts with a value in the **FIX (CR)** column. Expected "
+            f"allocation = `FIX (CR) x {fix_mult:,}` (3 -> 3,00,000). This rule has "
+            "the **highest precedence** -- it overrides the capital, previous-day "
+            "and Jainam rules."
+        )
+        if fixed.empty:
+            st.info("No fixed-allocation accounts in scope for this mode.")
+        else:
+            f_match = int((fixed["status"] == ac.STATUS_MATCH).sum())
+            f1, f2, f3 = st.columns(3)
+            f1.metric("Fixed Accounts", len(fixed))
+            f2.metric("Match", f_match)
+            f3.metric("Mismatch", len(fixed) - f_match)
+
+            def _fstyle(row):
+                bad = fixed.at[row.name, "status"] != ac.STATUS_MATCH
+                colour = ("background-color: #b71c1c; color: #ffffff"
+                          if bad else "background-color: #1b5e20; color: #e8f5e9")
+                return [colour] * len(row)
+
+            render_table(fixed.style.apply(_fstyle, axis=1).format({
+                "fix_cr": lambda v: "" if pd.isna(v) else f"{v:g}",
+                "expected_allocation": "{:,.0f}",
+                "actual_allocation": "{:,.0f}",
+                "difference": "{:,.0f}",
+            }, na_rep=""))
+
+        if not tables["fix_invalid"].empty:
+            st.warning(
+                f"{len(tables['fix_invalid'])} account(s) have an unusable "
+                "**FIX (CR)** value (0, negative or non-numeric). They were not "
+                "checked by any rule -- correct the sheet."
+            )
+            render_table(tables["fix_invalid"])
+
+    with t1:
+        st.subheader("Match / Mismatch by SubCategory")
+        st.caption("Capital-rule accounts only.")
+        summary = ac.build_summary(result)
+        if summary.empty:
+            st.info("Nothing to summarise.")
+        else:
+            render_table(summary)
+
+    with t2:
+        st.subheader("SubCategories not defined in the rules file")
+        unknown = tables["unknown_subcategory"]
+        if unknown.empty:
+            st.success("Every account maps to a defined SubCategory.")
+        else:
+            st.warning(
+                f"{len(unknown)} account(s) have a SubCategory that is not in the "
+                "rules file. They were NOT checked. Add them to "
+                "`config/allocation_rules.json` or correct the sheet."
+            )
+            counts = (
+                unknown[ac.SUBCATEGORY_COL].replace("", "<blank>")
+                .value_counts().rename_axis("SubCategory").reset_index(name="accounts")
+            )
+            render_table(counts)
+            render_table(unknown)
+
+        st.markdown("---")
+        st.subheader("Excluded by rule")
+        st.caption("SubCategories configured with action 'exclude' (PVT / PGB / PPS / PRD).")
+        if tables["excluded"].empty:
+            st.info("No excluded-SubCategory accounts in this mode.")
+        else:
+            render_table(tables["excluded"])
+
+        st.markdown("---")
+        st.subheader("JExceptions Acc (JA)")
+        st.caption("Expected allocation for these is derived separately -- rule pending.")
+        if tables["jexceptions"].empty:
+            st.info("No JA accounts in this mode.")
+        else:
+            render_table(tables["jexceptions"])
+
+    with t3:
+        st.subheader("In scope but not checked")
+        nr, nc = tables["not_in_running"], tables["no_capital"]
+        st.markdown(f"**Not present in the Running file** -- {len(nr)} account(s)")
+        if nr.empty:
+            st.success("None.")
+        else:
+            render_table(nr)
+        st.markdown(f"**No usable capital (blank or <= 0)** -- {len(nc)} account(s)")
+        if nc.empty:
+            st.success("None.")
+        else:
+            render_table(nc)
+
+        unroutable = tables["unroutable"]
+        st.markdown(f"**Cannot route to a check method** -- {len(unroutable)} account(s)")
+        st.caption(
+            "In scope, but matched no routing rule for this mode -- usually a blank "
+            "or unexpected Running Type."
+        )
+        if unroutable.empty:
+            st.success("None.")
+        else:
+            render_table(unroutable)
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        consolidated.to_excel(writer, sheet_name="All Accounts", index=False)
+        ac.build_summary(result).to_excel(writer, sheet_name="Summary", index=False)
+        result.to_excel(writer, sheet_name="Capital Rule", index=False)
+        if not result.empty:
+            result[result["status"] == "Mismatch"].to_excel(
+                writer, sheet_name="Capital Mismatches", index=False)
+        tables["prevday_result"].to_excel(writer, sheet_name="Previous Day", index=False)
+        if not tables["prevday_result"].empty:
+            tables["prevday_result"][tables["prevday_result"]["status"] == "Mismatch"].to_excel(
+                writer, sheet_name="Prev Day Mismatches", index=False)
+        tables["prevday_new"].to_excel(writer, sheet_name="New Accounts", index=False)
+        tables["jainam_result"].to_excel(writer, sheet_name="Jainam JA", index=False)
+        tables["fix_result"].to_excel(writer, sheet_name="Fixed", index=False)
+        tables["fix_invalid"].to_excel(writer, sheet_name="Fixed Invalid", index=False)
+        tables["unroutable"].to_excel(writer, sheet_name="Cannot Route", index=False)
+        tables["unknown_subcategory"].to_excel(writer, sheet_name="Unmapped SubCat", index=False)
+        tables["excluded"].to_excel(writer, sheet_name="Excluded", index=False)
+        tables["jexceptions"].to_excel(writer, sheet_name="JExceptions", index=False)
+        tables["not_in_running"].to_excel(writer, sheet_name="Not In Running", index=False)
+        tables["no_capital"].to_excel(writer, sheet_name="No Capital", index=False)
+    buf.seek(0)
+    st.download_button(
+        "Download Allocation Check Report",
+        data=buf,
+        file_name=f"allocation_check_{mode}.xlsx",
+        key="alloc_dl",
+    )
+
+
+# -----------------------------
+# SIDEBAR / DISPATCH
+# -----------------------------
 with st.sidebar:
+    st.markdown("### Section")
+    section = st.radio(
+        "Select check:",
+        options=[SECTION_LOGIN, SECTION_ALLOCATION],
+        index=0,
+        help=(
+            "Login Check: All Users vs Running Users reconciliation.\n"
+            "Allocation Check: expected trading allocation derived from running capital."
+        ),
+    )
     st.markdown("### Comparison Mode")
     mode = st.radio(
         "Select mode:",
         options=[MODE_0DTE, MODE_1DTE, MODE_4DTE],
         index=0,
         help=(
-            "0DTE: Base server exclusions only.\n"
-            "1DTE: 0DTE filters + RunningType in {POS, INT} & RunningDays in {DAILY, 1DTE/0DTE}.\n"
-            "4DTE: RunningType = POS & RunningDays = DAILY (no base server exclusions)."
+            "0DTE: all userids except excluded servers.\n"
+            "1DTE: RunningType POS & RunningDays in {1DTE/0DTE, DAILY}.\n"
+            "4DTE: RunningType POS & RunningDays DAILY."
         ),
     )
-    st.caption(f"Active mode: **{mode}**")
+    st.caption(f"Section: **{section}**  |  Mode: **{mode}**")
 
 st.markdown(
-    """
+    f"""
     <h1 style='text-align: center; color: #1f77b4;'>Megaserve Technologies</h1>
-    <h3 style='text-align: center; color: gray;'>Morning Sheet Comparison</h3>
+    <h3 style='text-align: center; color: gray;'>{section}</h3>
     <hr>
     """,
     unsafe_allow_html=True,
 )
 
-st.info(f"Running in **{mode}** mode. Change mode from the sidebar.")
-
-col1, col2 = st.columns(2)
-with col1:
-    file_all = st.file_uploader("Upload All Users Excel", type=["xlsx"])
-with col2:
-    file_run = st.file_uploader("Upload Running Users", type=["csv", "xlsx"])
-
-
-if file_all and file_run:
-
-    st.success("Files uploaded successfully. Processing...")
-
-    df_all = load_all_users(file_all)
-    df_run = load_running_users(file_run)
-
-    if df_all is None:
-        st.stop()
-
-    df_all = normalize_values(normalize_columns(df_all), is_running=False)
-    df_run = normalize_values(normalize_columns(df_run), is_running=True)
-
-    if OPERATOR_COL not in df_all.columns:
-        st.warning(
-            "No **Operator Name** column found in the All Users sheet -- "
-            "the operator column will be blank in every table."
-        )
-    if SL_COL not in df_all.columns:
-        st.warning(
-            "No **SL** column found in the All Users sheet -- the 0 SL tab will be empty."
-        )
-
-    # Raw running snapshot (as uploaded, before dedup / server exclusions) --
-    # used for the Summary tab pivot.
-    df_run_raw = df_run.copy()
-
-    df_all = apply_mode_filter(df_all, mode)
-
-    # Snapshot right after the DTE mode filter only (no dedup / server
-    # exclusions yet) -- used for the Summary tab's "All user" count.
-    df_all_mode_filtered = df_all.copy()
-
-    dup_all = get_duplicates(df_all, "All User")
-    dup_run = get_duplicates(df_run, "Running")
-    duplicate_tab = pd.concat([dup_all, dup_run], ignore_index=True)
-
-    df_all = remove_duplicates(df_all)
-    df_run = remove_duplicates(df_run)
-
-    cfg = MODE_FILTERS[mode]
-    if cfg["apply_base_exclusions"]:
-        df_all_clean, extra_all = split_extra(df_all, EXCLUDE_ALL_USERS, "AllUser")
-        df_run_clean, extra_run = split_extra(df_run, EXCLUDE_RUNNING, "Running")
-        extra_tab = pd.concat([extra_all, extra_run], ignore_index=True)[COLS + ["not found in"]]
-    else:
-        df_all_clean = df_all
-        df_run_clean = df_run
-        extra_tab = pd.DataFrame(columns=COLS + ["not found in"])
-
-    diff_tab = get_difference(df_all_clean, df_run_clean)
-    not_found_tab = get_not_found(df_all_clean, df_run_clean)
-
-    # Fixed tab: mode-filtered df_all, but DLR ACC / NOT RUNNING stripped inside
-    fixed_tab, fix_cr_invalid = build_fixed_tab(df_all)
-
-    allocation_tab = build_allocation_tab(df_all_clean, mode)
-
-    not_found_summary_tab = build_not_found_summary(not_found_tab)
-    running_pivot_tab = build_running_pivot(df_all_mode_filtered, df_run_raw)
-
-    # --- OPERATOR ---
-    # The userid universe for the operator lookup and the 0 SL pivot is the
-    # All Users sheet as filtered by the active DTE mode.
-    operator_lookup = build_operator_lookup(df_all_mode_filtered)
-
-    zero_sl_tab = build_zero_sl_pivot(df_all_mode_filtered, operator_lookup)
-
-    # Append operator_name as the last column of every table. The Difference
-    # tab has no plain algo/server, so resolve it off the All Users side.
-    diff_tab = attach_operator(diff_tab, operator_lookup, "algo_all", "server_all")
-    not_found_tab = attach_operator(not_found_tab, operator_lookup)
-    extra_tab = attach_operator(extra_tab, operator_lookup)
-    duplicate_tab = attach_operator(duplicate_tab, operator_lookup)[
-        ["userid", "Found in", OPERATOR_COL]
-    ]
-    allocation_tab = attach_operator(allocation_tab, operator_lookup)
-    not_found_summary_tab = attach_operator(not_found_summary_tab, operator_lookup)
-    running_pivot_tab = attach_operator(running_pivot_tab, operator_lookup)
-
-    # Fixed tab keeps _match last so the styler can still find it.
-    if not fixed_tab.empty:
-        fixed_tab = attach_operator(fixed_tab, operator_lookup)
-        fixed_tab = fixed_tab[
-            [c for c in fixed_tab.columns if c != "_match"] + ["_match"]
-        ]
-    fix_cr_invalid = attach_operator(fix_cr_invalid, operator_lookup)
-
-    # --- SUMMARY ---
-    st.markdown(f"### Summary -- {mode}")
-    m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
-    m1.metric("Differences", len(diff_tab))
-    m2.metric("Not Found", len(not_found_tab))
-    m3.metric("Extra Accounts", len(extra_tab))
-    m4.metric("Duplicates", len(duplicate_tab))
-    m5.metric("FIX Accounts", len(fixed_tab))
-    fixed_mismatches = int((~fixed_tab["_match"]).sum()) if not fixed_tab.empty else 0
-    m6.metric("FIX Mismatches", fixed_mismatches)
-    zero_sl_accounts = int(zero_sl_tab[ZERO_SL_COUNT_COL].sum()) if not zero_sl_tab.empty else 0
-    m7.metric("0 SL Accounts", zero_sl_accounts)
-    st.markdown("---")
-
-    # --- TABS ---
-    tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-        ["Summary", "Difference", "Not Found", "Extra", "Duplicate",
-         "Fixed", "Allocation", "0 SL"]
-    )
-
-    with tab0:
-        st.subheader(f"Running Users Pivot -- {mode}")
-        st.caption(
-            "Distinct userid count per Algo / Server. **All user** = from the "
-            f"All Users sheet filtered only by the **{mode}** RunningType/RunningDays "
-            "rule (no dedup / server exclusions applied here). **Running** = from "
-            "the Running Users sheet exactly as uploaded (before dedup / server exclusions)."
-        )
-        if running_pivot_tab.empty:
-            st.info("No data available to summarize.")
-        else:
-            render_table(running_pivot_tab)
-
-    with tab1:
-        st.subheader("Differences Between Sheets")
-        render_table(diff_tab)
-
-    with tab2:
-        st.subheader("Missing Users")
-        render_table(not_found_tab)
-
-        st.markdown("---")
-        st.subheader("Missing Users -- Summary by Algo / Server")
-        if not_found_summary_tab.empty:
-            st.info("No missing users to summarize.")
-        else:
-            render_table(not_found_summary_tab)
-
-    with tab3:
-        st.subheader("Excluded / Extra Accounts")
-        render_table(extra_tab)
-
-    with tab4:
-        st.subheader("Duplicate User IDs")
-        render_table(duplicate_tab)
-
-    with tab5:
-        st.subheader("Fixed Allocation Accounts")
-        st.caption(
-            "Accounts with a value in the **FIX (CR)** column of the main sheet. "
-            f"Expected allocation = FIX (CR) x {FIX_CR_MULTIPLIER:,} "
-            "(1 -> 100,000 | 1.6 -> 160,000 | 0.8 -> 80,000). "
-            "DLR ACC / NOT RUNNING / Z SERVER are excluded. "
-            f"Showing **{len(fixed_tab)}** FIX accounts "
-            f"(**{fixed_mismatches}** mismatches) for **{mode}** mode."
-        )
-
-        if not fix_cr_invalid.empty:
-            st.warning(
-                f"{len(fix_cr_invalid)} account(s) have an unusable **FIX (CR)** "
-                "value and were excluded from this tab. Please correct the sheet."
-            )
-            render_table(fix_cr_invalid)
-
-        if fixed_tab.empty:
-            st.info("No FIX accounts found for this mode.")
-        else:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total FIX Accounts", len(fixed_tab))
-            c2.metric("Matching", int(fixed_tab["_match"].sum()))
-            c3.metric("Mismatched", fixed_mismatches)
-            render_table(style_fixed_tab(fixed_tab))
-
-    with tab6:
-        threshold = ALLOC_THRESHOLD.get(mode)
-        if threshold is None:
-            st.info("Allocation check is not applicable for 0DTE mode.")
-        else:
-            st.subheader(f"Low Allocation Accounts -- {mode}")
-            st.caption(
-                f"Accounts with allocation > 0 and < {threshold:,} in {mode} mode. "
-                f"Found {len(allocation_tab)} account(s)."
-            )
-            if allocation_tab.empty:
-                st.success(f"All accounts meet the {threshold:,} allocation threshold.")
-            else:
-                def _style_alloc_row(row):
-                    return ["background-color: #e65100; color: #ffffff; font-weight: bold"] * len(row)
-
-                render_table(
-                    allocation_tab.style.apply(_style_alloc_row, axis=1).format(
-                        {"allocation": "{:,.0f}"}
-                    )
-                )
-
-    with tab7:
-        st.subheader(f"0 SL Accounts -- {mode}")
-        st.caption(
-            "Accounts running with **zero stop-loss**: distinct userid count per "
-            f"Algo / Server where the **SL** column is numerically 0, across the "
-            f"**{mode}** userid set. Blank SL cells mean 'no SL recorded' and are "
-            "**not** counted. All servers are included -- no exclusions applied here."
-        )
-        if zero_sl_tab.empty:
-            st.success("No accounts are running with 0 SL.")
-        else:
-            c1, c2 = st.columns(2)
-            c1.metric("0 SL Accounts", zero_sl_accounts)
-            c2.metric("Algo / Server Groups", len(zero_sl_tab))
-
-            def _style_zero_sl_row(row):
-                return ["background-color: #4a148c; color: #ffffff; font-weight: bold"] * len(row)
-
-            render_table(
-                zero_sl_tab.style.apply(_style_zero_sl_row, axis=1).format(
-                    {ZERO_SL_COUNT_COL: "{:,.0f}"}
-                )
-            )
-
-    # --- DOWNLOAD ---
-    excel_bytes = to_excel(
-        diff_tab, not_found_tab, extra_tab, duplicate_tab, fixed_tab, allocation_tab,
-        not_found_summary=not_found_summary_tab, running_summary=running_pivot_tab,
-        zero_sl=zero_sl_tab,
-    )
-    st.download_button(
-        "Download Full Report",
-        data=excel_bytes,
-        file_name=f"user_comparison_{mode}.xlsx",
-    )
+if section == SECTION_LOGIN:
+    render_login_check(mode)
+else:
+    render_allocation_check(mode)

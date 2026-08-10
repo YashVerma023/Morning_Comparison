@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "description": "Allocation Check rules. Edit this file to add, remove or re-weight SubCategories without touching code. Reloaded on every app run.",
+
+  "rounding": {
+    "basis": 2000000,
+    "mode": "half_up",
+    "divisor": 100,
+    "_comment": "category_capital is rounded to the nearest `basis` (20,00,000) with halves going UP, then divided by `divisor` to give the expected allocation. mode must be one of: half_up, floor, ceil. half_up is deliberate: Python/numpy round() rounds halves to even, which turns 90,00,000 into 80,00,000 instead of 1,00,00,000."
+  },
+
+  "fix": {
+    "enabled": true,
+    "column": "fix_cr",
+    "multiplier": 100000
+  },
+  "_fix_comment": "Accounts with a positive value in the All Users 'FIX (CR)' column are a fixed-allocation exception: expected allocation = FIX (CR) x multiplier (3 -> 3,00,000). This has the HIGHEST precedence -- it overrides the capital rule, the previous-day rule AND the Jainam (JA) rule. A blank cell means the account is not fixed and follows the normal path. A populated but unusable value (0, negative, or text) is reported as 'Not under check' rather than silently falling through.",
+
+  "jainam": {
+    "sheet_name": "Jainam",
+    "userid_column": "UserID",
+    "allocation_column": "ALLOCATION",
+    "multiplier": 100000,
+    "exclude_userids": ["total", "grand total", ""]
+  },
+  "_jainam_comment": "Accounts whose SubCategory has action 'jexception' (JA) are checked against the 'Jainam' sheet inside the SAME All Users workbook, not against running capital. expected allocation = ALLOCATION x multiplier. ALLOCATION 0 means the expected allocation IS zero, so a non-zero Main allocation is a mismatch. All rows are used regardless of Date. exclude_userids drops the sheet's trailing Total row. A JA account with no row in the Jainam sheet is a mismatch. This check overrides the mode routing: a JA account never goes through the capital or previous-day path.",
+
+  "excluded_servers": ["dlr acc", "not running"],
+  "_excluded_servers_comment": "Matched case-insensitively against the All Users `server` column. These accounts are never checked in any DTE mode.",
+
+  "dte_filters": {
+    "0DTE": {
+      "runningtype": null,
+      "runningdays": null,
+      "_comment": "All userids except the excluded servers."
+    },
+    "1DTE": {
+      "runningtype": ["pos"],
+      "runningdays": ["1dte/0dte", "daily"]
+    },
+    "4DTE": {
+      "runningtype": ["pos"],
+      "runningdays": ["daily"]
+    }
+  },
+  "_dte_filters_comment": "Values are compared lower-cased with spaces stripped. null means no filter on that column. NOTE: these are the Allocation Check filters and are intentionally independent of the Login Check filters in morning_comp.py (1DTE differs: no INT here).",
+
+  "previous_day": {
+    "required": ["0DTE"],
+    "optional": ["1DTE"],
+    "unused": ["4DTE"]
+  },
+  "_previous_day_comment": "required = the check refuses to run without the previous-day All Users sheet. optional = the sheet changes how accounts are routed but is not mandatory. unused = the uploader is hidden.",
+
+  "routing": {
+    "0DTE": {
+      "with_previous_day": [
+        { "method": "capital",      "runningtype": ["int"] },
+        { "method": "previous_day", "runningtype": ["pos"] }
+      ],
+      "without_previous_day": []
+    },
+    "1DTE": {
+      "with_previous_day": [
+        { "method": "capital",      "runningtype": ["pos"], "runningdays": ["1dte/0dte"] },
+        { "method": "previous_day", "runningtype": ["pos"], "runningdays": ["daily"] }
+      ],
+      "without_previous_day": [
+        { "method": "capital" }
+      ]
+    },
+    "4DTE": {
+      "with_previous_day": [
+        { "method": "capital" }
+      ],
+      "without_previous_day": [
+        { "method": "capital" }
+      ]
+    }
+  },
+  "_routing_comment": "Rules are evaluated in order against each in-scope account; the FIRST match wins. A rule with no runningtype/runningdays matches everything. method must be 'capital' (expected allocation derived from running capital) or 'previous_day' (today's allocation must equal the previous day's). Any in-scope account matching no rule is reported in the 'Cannot route' table rather than being silently dropped.",
+
+  "subcategories": {
+    "CC":  { "action": "check", "pct": 1.00 },
+    "CCG": { "action": "check", "pct": 1.00 },
+
+    "CCV": { "action": "check", "pct": 0.60 },
+    "MSS": { "action": "check", "pct": 0.60 },
+    "MSV": { "action": "check", "pct": 0.60 },
+
+    "MSR": { "action": "check", "pct": 0.20 },
+    "MSP": { "action": "check", "pct": 0.20 },
+    "MSN": { "action": "check", "pct": 0.20 },
+
+    "PVT": { "action": "exclude", "reason": "Excluded from expected-allocation calculation" },
+    "PGB": { "action": "exclude", "reason": "Excluded from expected-allocation calculation" },
+    "PPS": { "action": "exclude", "reason": "Excluded from expected-allocation calculation" },
+    "PRD": { "action": "exclude", "reason": "Excluded from expected-allocation calculation" },
+
+    "JA":  { "action": "jexception", "reason": "JExceptions Acc - expected allocation derived separately (rule pending)" }
+  },
+  "_subcategories_comment": "action must be one of: check (needs pct), exclude, jexception. pct is the share of running `capital` deployed as trading allocation. Any SubCategory found in the sheet but absent from this map is reported in the 'Unknown SubCategory' table and is never silently dropped."
+}
