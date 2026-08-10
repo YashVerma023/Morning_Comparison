@@ -691,6 +691,28 @@ def build_previous_day_check(
 # -----------------------------
 # EXCLUDED ALGOS
 # -----------------------------
+def normalize_subcategory(value) -> str:
+    """
+    Canonical SubCategory string, safe for any input dtype.
+
+    Blank / NaN / NA -> "". Numeric SubCategories such as 13199650 stringify
+    without a trailing ".0", so they match a rules entry of the same name.
+    """
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, float) and float(value).is_integer():
+        text = str(int(value))
+    else:
+        text = str(value)
+    text = text.strip().upper()
+    return "" if text in ("NAN", "NONE", "NAT", "<NA>", "NULL") else text
+
+
 def algo_key(value) -> str:
     """
     Canonical form of an algo for comparison.
@@ -1068,10 +1090,12 @@ def build_allocation_check(
 
     # --- 1. classify by SubCategory (JA is extracted before any routing) ---
     work = remaining.copy()
-    work[SUBCATEGORY_COL] = work[SUBCATEGORY_COL].astype(str).str.strip().str.upper()
-    work.loc[work[SUBCATEGORY_COL].isin(["NAN", "NONE", ""]), SUBCATEGORY_COL] = ""
+    # Element-wise rather than .astype(str).str.upper(): on a nullable dtype
+    # (string[python], Float64) the .str accessor propagates NA instead of
+    # stringifying it, leaving floats mixed in with strings downstream.
+    work[SUBCATEGORY_COL] = work[SUBCATEGORY_COL].map(normalize_subcategory)
 
-    sub_rules = {k.strip().upper(): v for k, v in rules["subcategories"].items()}
+    sub_rules = {str(k).strip().upper(): v for k, v in rules["subcategories"].items()}
     action = work[SUBCATEGORY_COL].map(lambda s: sub_rules.get(s, {}).get("action"))
 
     unknown = work[action.isna()].copy()
@@ -1080,11 +1104,12 @@ def build_allocation_check(
     checkable = work[action == "check"].copy()
 
     if not unknown.empty:
+        # str() on every element: this is only a log line and must never be the
+        # thing that takes the check down.
+        seen = sorted({str(v) if str(v) else "<blank>" for v in unknown[SUBCATEGORY_COL]})
         logger.warning(
             "Allocation Check %s: %d account(s) have a SubCategory not defined "
-            "in the rules file: %s",
-            mode, len(unknown),
-            sorted(set(unknown[SUBCATEGORY_COL].replace("", "<blank>"))),
+            "in the rules file: %s", mode, len(unknown), seen,
         )
 
     # --- 2. JA accounts -> Jainam sheet ---
