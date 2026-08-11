@@ -1258,6 +1258,63 @@ def render_allocation_check(mode: str) -> None:
             },
         )
 
+        with st.form("add_subcategory_form", clear_on_submit=True):
+            a1, a2, a3 = st.columns([2, 1, 1])
+            new_name = a1.text_input("New SubCategory", placeholder="e.g. MSX",
+                                     label_visibility="collapsed")
+            new_pct = a2.number_input("%", min_value=0, max_value=100, value=100,
+                                      step=1, label_visibility="collapsed")
+            add_clicked = a3.form_submit_button("Add category", **width_kwargs())
+        st.caption(
+            "Add a category above, or type directly in the last row of the table. "
+            "0 % means Exclude."
+        )
+        if add_clicked:
+            name = (new_name or "").strip().upper()
+            if not name:
+                st.warning("Enter a SubCategory name to add.")
+            elif name in {str(v).strip().upper() for v in edited[ac.EDITOR_SUBCATEGORY]}:
+                st.warning(f"SubCategory **{name}** already exists.")
+            else:
+                try:
+                    subs = ac.editor_to_subcategories(edited)
+                    subs[name] = (
+                        {"action": "exclude", "pct": 0} if new_pct == 0
+                        else {"action": "check", "pct": int(new_pct)}
+                    )
+                    updated = dict(rules)
+                    updated["subcategories"] = subs
+                    ac.save_rules(updated)
+                    st.success(f"Added **{name}** at {new_pct}%.")
+                    st.rerun()
+                except ac.AllocationRulesError as exc:
+                    st.error(f"Not added -- {exc}")
+
+        st.markdown("**Broker rules**")
+        st.caption(
+            "Per-broker overrides matched on the All Users **Broker** column. "
+            "These outrank the Fixed, Jainam and category rules. "
+            "*% of capital* takes that share of the running capital; "
+            "*From FIX (CR)* derives the allocation from the FIX column "
+            "(multiplier 1,00,000 means FIX 1 -> 1,00,000)."
+        )
+        broker_edited = st.data_editor(
+            ac.broker_rules_to_editor(rules),
+            key="broker_editor",
+            num_rows="dynamic",
+            hide_index=True,
+            column_config={
+                ac.BROKER_EDITOR_NAME: st.column_config.TextColumn(
+                    "Broker", help="Exact broker name, matched case-insensitively."),
+                ac.BROKER_EDITOR_METHOD: st.column_config.SelectboxColumn(
+                    "Rule", options=ac.BROKER_METHOD_LABELS),
+                ac.BROKER_EDITOR_VALUE: st.column_config.NumberColumn(
+                    "Value", help="Percentage (1-100) or the FIX multiplier.",
+                    min_value=0, step=1, format="%d"),
+            },
+            **width_kwargs(),
+        )
+
         st.markdown("**Excluded algos**")
         algos_text = st.text_input(
             "Algos to skip (comma separated)",
@@ -1276,6 +1333,7 @@ def render_allocation_check(mode: str) -> None:
             try:
                 updated = dict(rules)
                 updated["subcategories"] = ac.editor_to_subcategories(edited)
+                updated["broker_rules"] = ac.editor_to_broker_rules(broker_edited)
                 updated["excluded_algos"] = ac.parse_excluded_algos(algos_text)
                 path = ac.save_rules(updated)
                 st.success(f"Rules saved to `{path}`. Re-running the check.")
@@ -1432,339 +1490,107 @@ def render_allocation_check(mode: str) -> None:
             "separately, so they appear as repeated rows below."
         )
 
-    prevday = tables["prevday_result"]
-    p_match = int((prevday["status"] == "Match").sum()) if not prevday.empty else 0
-    p_mismatch = len(prevday) - p_match
+    # --- VIEWS: mirror the downloaded workbook exactly -------------------
+    export = ac.build_export(tables, in_scope)
+    zero_sl = tables.get("zero_sl_result", pd.DataFrame())
+    sheets = ac.export_sheets(export, zero_sl)
+
+    mismatches = int((export["status"] == ac.STATUS_MISMATCH).sum()) if not export.empty else 0
+    sl_bad = int((zero_sl["status"] == ac.STATUS_MISMATCH).sum()) if not zero_sl.empty else 0
 
     st.markdown(f"### Allocation Check Summary -- {mode}")
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("In Scope", len(in_scope))
-    m2.metric("Capital Rule", len(result), delta=f"{n_mismatch} mismatch" if n_mismatch else None,
-              delta_color="inverse")
-    m3.metric("Capital Match", n_match)
-    m4.metric("Prev-Day Rule", len(prevday),
-              delta=f"{p_mismatch} mismatch" if p_mismatch else None, delta_color="inverse")
-    m5.metric("Prev-Day Match", p_match)
-    m6.metric("Unmapped SubCat", len(tables["unknown_subcategory"]))
+    m2.metric("Allocation Mismatches", mismatches)
+    m3.metric("Not Checked", len(sheets["Not Checked"]))
+    m4.metric("0 SL Accounts", len(zero_sl))
+    m5.metric("0 SL Mismatches", sl_bad)
     st.caption(msg)
     st.markdown("---")
 
-    consolidated = ac.build_consolidated(tables, in_scope)
-
-    tc, t0, tp, tj, tf, t1, t2, t3 = st.tabs(
-        ["All Accounts", "Capital Rule", "Previous Day", "Jainam (JA)", "Fixed",
-         "By SubCategory", "Unmapped / Excluded", "Not Checked"]
+    st.caption(
+        "These tabs are exactly the sheets in the downloaded report. "
+        "**Summary** holds one row per in-scope account; each rule tab is a "
+        "filter on it. **0 SL** is separate because it checks max loss rather "
+        "than allocation, so an account can appear there as well as on its "
+        "allocation rule."
     )
 
-    with tc:
-        st.subheader(f"All In-Scope Accounts -- {mode}")
-        st.caption(
-            "One row per in-scope account across both check methods. "
-            "**rule** is the percentage for capital-rule accounts, 'Previous Day' "
-            "for previous-day accounts. **expected allocation** is whichever value "
-            "the account was measured against. **category capital** and **capital** "
-            "apply only to capital-rule rows."
+    _PALETTE = {
+        ac.STATUS_MISMATCH: "background-color: #b71c1c; color: #ffffff",
+        ac.STATUS_MATCH: "background-color: #1b5e20; color: #e8f5e9",
+        ac.STATUS_NEW_USER: "background-color: #0d47a1; color: #e3f2fd",
+        ac.STATUS_NOT_CHECKED: "background-color: #424242; color: #eeeeee",
+    }
+
+    def show_sheet(frame: pd.DataFrame, key: str) -> None:
+        """Metrics, a mismatch filter and a colour-coded table."""
+        if frame.empty:
+            st.info("No accounts in this view.")
+            return
+
+        counts = frame["status"].value_counts()
+        cols = st.columns(max(len(counts), 1))
+        for col, (label, n) in zip(cols, counts.items()):
+            col.metric(str(label), int(n))
+
+        options = list(counts.index)
+        default = [s for s in (ac.STATUS_MISMATCH, ac.STATUS_NEW_USER) if s in options]
+        chosen = st.multiselect(
+            "Filter by status", options=options, default=default or options,
+            key=f"filter_{key}",
         )
-        if consolidated.empty:
-            st.info("No accounts in scope for this mode.")
-        else:
-            counts = ac.consolidated_status_counts(consolidated)
-            cols = st.columns(max(len(counts), 1))
-            for col, (_, r) in zip(cols, counts.iterrows()):
-                col.metric(r["status"], int(r["accounts"]))
+        view = frame[frame["status"].isin(chosen)] if chosen else frame
+        if view.empty:
+            st.success("Nothing to show for the selected status.")
+            return
 
-            status_filter = st.multiselect(
-                "Filter by status",
-                options=list(counts["status"]),
-                default=[s for s in (ac.STATUS_MISMATCH, ac.STATUS_NEW_USER)
-                         if s in set(counts["status"])] or list(counts["status"]),
-                key="cons_filter",
-            )
-            cview = (
-                consolidated[consolidated["status"].isin(status_filter)]
-                if status_filter else consolidated
-            )
+        def _style(row):
+            return [_PALETTE.get(view.at[row.name, "status"], "")] * len(row)
 
-            _palette = {
-                ac.STATUS_MISMATCH: "background-color: #b71c1c; color: #ffffff",
-                ac.STATUS_MATCH: "background-color: #1b5e20; color: #e8f5e9",
-                ac.STATUS_NEW_USER: "background-color: #0d47a1; color: #e3f2fd",
-                ac.STATUS_NOT_CHECKED: "background-color: #424242; color: #eeeeee",
-            }
+        st.caption(f"Showing {len(view):,} of {len(frame):,} rows.")
+        render_table(view.style.apply(_style, axis=1).format(
+            indian_formats(view, {"pct": lambda v: "" if pd.isna(v) else f"{v:g}%"}),
+            na_rep="",
+        ))
 
-            def _cstyle(row):
-                return [_palette.get(cview.at[row.name, "status"], "")] * len(row)
-
-            if cview.empty:
-                st.info("No rows for the selected status.")
-            else:
-                st.caption(f"Showing {len(cview):,} of {len(consolidated):,} accounts.")
-                render_table(cview.style.apply(_cstyle, axis=1).format(
-                    indian_formats(cview), na_rep=""))
-
-    with t0:
-        st.subheader(f"Expected vs Actual Allocation -- {mode}")
-        if result.empty:
-            st.info("No accounts to check in this mode.")
-        else:
-            only_mismatch = st.checkbox("Show mismatches only", value=True)
-            view = result[result["status"] == "Mismatch"] if only_mismatch else result
-
-            def _style(row):
-                bad = view.at[row.name, "status"] == "Mismatch"
-                colour = ("background-color: #b71c1c; color: #ffffff"
-                          if bad else "background-color: #1b5e20; color: #e8f5e9")
-                return [colour] * len(row)
-
-            if view.empty:
-                st.success("No mismatches.")
-            else:
-                render_table(view.style.apply(_style, axis=1).format(
-                    indian_formats(view, {"pct": "{:g}%"}), na_rep=""))
-
-    with tp:
-        st.subheader(f"Today vs Previous Day Allocation -- {mode}")
-        st.caption(
-            "A straight allocation-vs-allocation comparison against the previous "
-            "day's All Users sheet. SubCategory percentages and running capital "
-            "play no part here -- the two allocations must simply be equal."
-        )
-        if prevday.empty and tables["prevday_new"].empty:
-            if not show_prev:
-                st.info(f"The previous-day check does not apply in {mode} mode.")
-            elif df_prev is None:
-                st.info(
-                    "No previous-day sheet uploaded, so every account was checked "
-                    "against running capital instead."
+    tab_names = list(sheets)
+    tabs = st.tabs([f"{n} ({len(sheets[n])})" for n in tab_names])
+    for name, tab in zip(tab_names, tabs):
+        with tab:
+            if name == "Summary":
+                st.subheader(f"All In-Scope Accounts -- {mode}")
+                st.caption(f"{len(sheets[name]):,} accounts, one row each.")
+            elif name == ac.RULE_ZERO_SL:
+                mult = ac.zero_sl_config(rules)["max_loss_multiplier"]
+                st.subheader(f"0 SL Accounts -- {mode}")
+                st.caption(
+                    f"Accounts with a numeric **0** in the SL column must satisfy "
+                    f"**max_loss = allocation x {mult}**. A blank SL cell means "
+                    "'no SL recorded' and is not checked. This is a max-loss "
+                    "check, so these accounts are also checked for allocation "
+                    "under their own rule."
                 )
+            elif name == "Algo":
+                st.subheader(f"Algo Rules -- {mode}")
+                st.caption("Algo rules are not configured yet.")
             else:
-                st.info("No accounts routed to the previous-day check in this mode.")
-        else:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Compared", len(prevday))
-            c2.metric("Match", p_match)
-            c3.metric("Mismatch", p_mismatch)
+                st.subheader(f"{name} Rule -- {mode}")
+            show_sheet(sheets[name], name)
 
-            if not prevday.empty:
-                only_mm = st.checkbox("Show mismatches only", value=True, key="prev_mm")
-                pview = prevday[prevday["status"] == "Mismatch"] if only_mm else prevday
-
-                def _pstyle(row):
-                    bad = pview.at[row.name, "status"] == "Mismatch"
-                    colour = ("background-color: #b71c1c; color: #ffffff"
-                              if bad else "background-color: #1b5e20; color: #e8f5e9")
-                    return [colour] * len(row)
-
-                if pview.empty:
-                    st.success("No mismatches against the previous day.")
-                else:
-                    render_table(pview.style.apply(_pstyle, axis=1).format(
-                        indian_formats(pview), na_rep=""))
-
-            new_accts = tables["prevday_new"]
-            st.markdown("---")
-            st.markdown(f"**New accounts -- not in the previous-day sheet** ({len(new_accts)})")
-            st.caption("Reported separately, not counted as mismatches.")
-            if new_accts.empty:
-                st.success("None.")
-            else:
-                render_table(new_accts.drop(columns=["previous_allocation", "difference"]))
-
-    with tj:
-        jainam = tables["jainam_result"]
-        st.subheader(f"JA Accounts vs the {jainam_sheet_name} Sheet")
-        st.caption(
-            f"SubCategory **JA** accounts are checked against the **{jainam_sheet_name}** "
-            "sheet inside the same All Users workbook, not against running capital. "
-            f"Expected allocation = `ALLOCATION x {ac.jainam_config(rules)['multiplier']:,}` "
-            "(4 -> 4,00,000). An ALLOCATION of 0 means the expected allocation IS zero. "
-            "All rows are used regardless of Date; the sheet's Total row is dropped. "
-            "This check overrides the mode routing."
-        )
-        if jainam.empty:
-            st.info("No JA accounts in scope for this mode.")
-        else:
-            j_match = int((jainam["status"] == ac.STATUS_MATCH).sum())
-            j1, j2, j3 = st.columns(3)
-            j1.metric("JA Accounts", len(jainam))
-            j2.metric("Match", j_match)
-            j3.metric("Mismatch", len(jainam) - j_match)
-
-            def _jstyle(row):
-                bad = jainam.at[row.name, "status"] != ac.STATUS_MATCH
-                colour = ("background-color: #b71c1c; color: #ffffff"
-                          if bad else "background-color: #1b5e20; color: #e8f5e9")
-                return [colour] * len(row)
-
-            render_table(jainam.style.apply(_jstyle, axis=1).format(
-                indian_formats(jainam), na_rep=""))
-
-    with tf:
-        fixed = tables["fix_result"]
-        fix_mult = ac.fix_config(rules)["multiplier"]
-        st.subheader(f"Fixed Allocation Accounts -- {mode}")
-        st.caption(
-            f"Accounts with a value in the **FIX (CR)** column. Expected "
-            f"allocation = `FIX (CR) x {fix_mult:,}` (3 -> 3,00,000). This rule has "
-            "the **highest precedence** -- it overrides the capital, previous-day "
-            "and Jainam rules."
-        )
-        if fixed.empty:
-            st.info("No fixed-allocation accounts in scope for this mode.")
-        else:
-            f_match = int((fixed["status"] == ac.STATUS_MATCH).sum())
-            f1, f2, f3 = st.columns(3)
-            f1.metric("Fixed Accounts", len(fixed))
-            f2.metric("Match", f_match)
-            f3.metric("Mismatch", len(fixed) - f_match)
-
-            def _fstyle(row):
-                bad = fixed.at[row.name, "status"] != ac.STATUS_MATCH
-                colour = ("background-color: #b71c1c; color: #ffffff"
-                          if bad else "background-color: #1b5e20; color: #e8f5e9")
-                return [colour] * len(row)
-
-            render_table(fixed.style.apply(_fstyle, axis=1).format(
-                indian_formats(fixed,
-                               {"fix_cr": lambda v: "" if pd.isna(v) else f"{v:g}"}),
-                na_rep=""))
-
-        if not tables["fix_invalid"].empty:
-            st.warning(
-                f"{len(tables['fix_invalid'])} account(s) have an unusable "
-                "**FIX (CR)** value (0, negative or non-numeric). They were not "
-                "checked by any rule -- correct the sheet."
-            )
-            render_table(tables["fix_invalid"])
-
-    with t1:
-        st.subheader("Match / Mismatch by SubCategory")
-        st.caption("Capital-rule accounts only.")
-        summary = ac.build_summary(result)
-        if summary.empty:
-            st.info("Nothing to summarise.")
-        else:
-            render_table(summary)
-
-    with t2:
-        st.subheader("SubCategories not defined in the rules file")
-        unknown = tables["unknown_subcategory"]
-        if unknown.empty:
-            st.success("Every account maps to a defined SubCategory.")
-        else:
-            st.warning(
-                f"{len(unknown)} account(s) have a SubCategory that is not in the "
-                "rules file. They were NOT checked. Add them to "
-                "`config/allocation_rules.json` or correct the sheet."
-            )
-            counts = (
-                unknown[ac.SUBCATEGORY_COL].replace("", "<blank>")
-                .value_counts().rename_axis("SubCategory").reset_index(name="accounts")
-            )
-            render_table(counts)
-            render_table(unknown)
-
-        st.markdown("---")
-        st.subheader("Excluded by rule")
-        st.caption("SubCategories configured with action 'exclude' (PVT / PGB / PPS / PRD).")
-        if tables["excluded"].empty:
-            st.info("No excluded-SubCategory accounts in this mode.")
-        else:
-            render_table(tables["excluded"])
-
-        st.markdown("---")
-        st.subheader("JExceptions Acc (JA)")
-        st.caption("Expected allocation for these is derived separately -- rule pending.")
-        if tables["jexceptions"].empty:
-            st.info("No JA accounts in this mode.")
-        else:
-            render_table(tables["jexceptions"])
-
-    with t3:
-        st.subheader("In scope but not checked")
-        nr, nc = tables["not_in_running"], tables["no_capital"]
-        st.markdown(f"**Not present in the Running file** -- {len(nr)} account(s)")
-        if nr.empty:
-            st.success("None.")
-        else:
-            render_table(nr)
-        st.markdown(f"**No usable capital (blank or <= 0)** -- {len(nc)} account(s)")
-        if nc.empty:
-            st.success("None.")
-        else:
-            render_table(nc)
-
-        excl_algo = tables["excluded_algo"]
-        st.markdown(f"**Algo excluded by rule** -- {len(excl_algo)} account(s)")
-        st.caption(
-            f"Configured excluded algos: "
-            f"{ac.format_excluded_algos(rules) or '(none)'}"
-        )
-        if excl_algo.empty:
-            st.success("None.")
-        else:
-            render_table(excl_algo)
-
-        unroutable = tables["unroutable"]
-        st.markdown(f"**Cannot route to a check method** -- {len(unroutable)} account(s)")
-        st.caption(
-            "In scope, but matched no routing rule for this mode -- usually a blank "
-            "or unexpected Running Type."
-        )
-        if unroutable.empty:
-            st.success("None.")
-        else:
-            render_table(unroutable)
-
+    # --- DOWNLOAD -------------------------------------------------------
+    # Same frames as the tabs above, so screen and file can never disagree.
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-        consolidated.to_excel(writer, sheet_name="All Accounts", index=False)
-        ac.build_summary(result).to_excel(writer, sheet_name="Summary", index=False)
-        result.to_excel(writer, sheet_name="Capital Rule", index=False)
-        if not result.empty:
-            result[result["status"] == "Mismatch"].to_excel(
-                writer, sheet_name="Capital Mismatches", index=False)
-        tables["prevday_result"].to_excel(writer, sheet_name="Previous Day", index=False)
-        if not tables["prevday_result"].empty:
-            tables["prevday_result"][tables["prevday_result"]["status"] == "Mismatch"].to_excel(
-                writer, sheet_name="Prev Day Mismatches", index=False)
-        tables["prevday_new"].to_excel(writer, sheet_name="New Accounts", index=False)
-        tables["jainam_result"].to_excel(writer, sheet_name="Jainam JA", index=False)
-        tables["fix_result"].to_excel(writer, sheet_name="Fixed", index=False)
-        tables["fix_invalid"].to_excel(writer, sheet_name="Fixed Invalid", index=False)
-
-        for name, frame in (
-            ("All Accounts", consolidated),
-            ("Summary", ac.build_summary(result)),
-            ("Capital Rule", result),
-            ("Capital Mismatches", result[result["status"] == "Mismatch"]
-                if not result.empty else None),
-            ("Previous Day", tables["prevday_result"]),
-            ("Prev Day Mismatches", tables["prevday_result"][
-                tables["prevday_result"]["status"] == "Mismatch"]
-                if not tables["prevday_result"].empty else None),
-            ("New Accounts", tables["prevday_new"]),
-            ("Jainam JA", tables["jainam_result"]),
-            ("Fixed", tables["fix_result"]),
-            ("Fixed Invalid", tables["fix_invalid"]),
-            ("Unmapped SubCat", tables["unknown_subcategory"]),
-            ("Excluded", tables["excluded"]),
-            ("JExceptions", tables["jexceptions"]),
-            ("Not In Running", tables["not_in_running"]),
-            ("No Capital", tables["no_capital"]),
-            ("Excluded Algo", tables["excluded_algo"]),
-            ("Cannot Route", tables["unroutable"]),
-        ):
-            if frame is not None and name in writer.sheets:
-                apply_excel_indian_format(writer, name, frame)
-        tables["excluded_algo"].to_excel(writer, sheet_name="Excluded Algo", index=False)
-        tables["unroutable"].to_excel(writer, sheet_name="Cannot Route", index=False)
-        tables["unknown_subcategory"].to_excel(writer, sheet_name="Unmapped SubCat", index=False)
-        tables["excluded"].to_excel(writer, sheet_name="Excluded", index=False)
-        tables["jexceptions"].to_excel(writer, sheet_name="JExceptions", index=False)
-        tables["not_in_running"].to_excel(writer, sheet_name="Not In Running", index=False)
-        tables["no_capital"].to_excel(writer, sheet_name="No Capital", index=False)
+        for name, frame in sheets.items():
+            frame.to_excel(writer, sheet_name=name, index=False)
+            apply_excel_indian_format(writer, name, frame)
     buf.seek(0)
+
+    counts = " | ".join(
+        f"{name} {len(frame)}" for name, frame in sheets.items() if name != "Summary"
+    )
+    st.caption(f"Report sheets -- Summary {len(export)} | {counts}")
     st.download_button(
         "Download Allocation Check Report",
         data=buf,

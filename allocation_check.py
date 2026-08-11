@@ -78,7 +78,34 @@ STATUS_NEW_USER = "New user"
 RULE_PREVIOUS_DAY = "Previous Day"
 RULE_JAINAM = "Jainam"
 RULE_FIX = "Fixed"
+RULE_BROKER = "Broker"
 RULE_NOT_CHECKED = "Not under check"
+
+# Broker rule methods.
+BROKER_METHOD_CAPITAL_PCT = "capital_pct"
+BROKER_METHOD_FIX = "fix_allocation"
+VALID_BROKER_METHODS = {BROKER_METHOD_CAPITAL_PCT, BROKER_METHOD_FIX}
+
+BROKER_COL = "broker"
+
+# -----------------------------
+# 0 SL MAX-LOSS RULE
+# -----------------------------
+SL_COL = "sl"
+RULE_ZERO_SL = "0 SL"
+
+ZERO_SL_COLUMNS = [
+    "userid", "alias", "server", "algo", SUBCATEGORY_COL, "sl",
+    "allocation", "max_loss", "expected_max_loss", "difference",
+    "status", "operator_name",
+]
+
+BROKER_COLUMNS = [
+    "userid", "alias", "server", "algo", SUBCATEGORY_COL, BROKER_COL,
+    "broker_rule", "pct", "fix_cr", CAPITAL_COL, "category_capital",
+    "rounded_capital", "expected_allocation", "actual_allocation",
+    "difference", "status", "operator_name",
+]
 
 # Internal name for the All Users "FIX (CR)" column. Declared here rather than
 # imported from morning_comp, which imports this module.
@@ -87,8 +114,9 @@ FIX_BLANK_TOKENS = {"", "nan", "none", "null", "-", "na", "n/a"}
 
 FIX_COLUMNS = [
     "userid", "alias", "server", "algo", SUBCATEGORY_COL,
-    "fix_cr", "expected_allocation", "actual_allocation",
-    "difference", "status", "operator_name",
+    "fix_cr", "pct", "fixed_capital", "category_capital", "rounded_capital",
+    "expected_allocation", "actual_allocation", "difference", "status",
+    "operator_name",
 ]
 
 JAINAM_COLUMNS = [
@@ -175,6 +203,41 @@ def _validate_rules(rules: dict, source: Path) -> None:
         raise AllocationRulesError(
             f"excluded_algos must be a list, got {rules['excluded_algos']!r}."
         )
+
+    brokers = rules.get("broker_rules") or {}
+    if not isinstance(brokers, dict):
+        raise AllocationRulesError("broker_rules must be an object.")
+    for name, cfg in brokers.items():
+        if not isinstance(cfg, dict):
+            raise AllocationRulesError(f"Broker '{name}' must map to an object.")
+        method = cfg.get("method")
+        if method not in VALID_BROKER_METHODS:
+            raise AllocationRulesError(
+                f"Broker '{name}' has method {method!r}; must be one of "
+                f"{sorted(VALID_BROKER_METHODS)}."
+            )
+        if method == BROKER_METHOD_CAPITAL_PCT:
+            pct = cfg.get("pct")
+            if not isinstance(pct, (int, float)) or isinstance(pct, bool):
+                raise AllocationRulesError(
+                    f"Broker '{name}' method 'capital_pct' needs a numeric pct, "
+                    f"got {pct!r}."
+                )
+            if pct <= 0 or pct > 100:
+                raise AllocationRulesError(
+                    f"Broker '{name}' pct must be between 0 and 100, got {pct!r}."
+                )
+            if 0 < pct < 1:
+                raise AllocationRulesError(
+                    f"Broker '{name}' pct is {pct!r}, which reads as {pct}% of "
+                    f"capital. If you meant {pct * 100:g}%, write {pct * 100:g}."
+                )
+        else:
+            mult = cfg.get("multiplier", 100_000)
+            if not isinstance(mult, (int, float)) or isinstance(mult, bool) or mult <= 0:
+                raise AllocationRulesError(
+                    f"Broker '{name}' multiplier must be a positive number, got {mult!r}."
+                )
 
     if not rules["subcategories"]:
         raise AllocationRulesError("subcategories is empty -- nothing would be checked.")
@@ -385,6 +448,81 @@ def editor_to_subcategories(edited: pd.DataFrame) -> dict:
 
     if not out:
         raise AllocationRulesError("At least one SubCategory must be defined.")
+    return out
+
+
+BROKER_EDITOR_NAME = "Broker"
+BROKER_EDITOR_METHOD = "Rule"
+BROKER_EDITOR_VALUE = "Value"
+BROKER_EDITOR_COLUMNS = [BROKER_EDITOR_NAME, BROKER_EDITOR_METHOD, BROKER_EDITOR_VALUE]
+
+BROKER_LABEL_PCT = "% of capital"
+BROKER_LABEL_FIX = "From FIX (CR)"
+BROKER_METHOD_LABELS = [BROKER_LABEL_PCT, BROKER_LABEL_FIX]
+
+
+def broker_rules_to_editor(rules: dict) -> pd.DataFrame:
+    """Broker rules -> editable table."""
+    rows = []
+    for name, cfg in (rules.get("broker_rules") or {}).items():
+        is_pct = cfg.get("method") == BROKER_METHOD_CAPITAL_PCT
+        rows.append({
+            BROKER_EDITOR_NAME: name,
+            BROKER_EDITOR_METHOD: BROKER_LABEL_PCT if is_pct else BROKER_LABEL_FIX,
+            BROKER_EDITOR_VALUE: float(
+                cfg.get("pct", 0) if is_pct else cfg.get("multiplier", 100_000)
+            ),
+        })
+    return pd.DataFrame(rows, columns=BROKER_EDITOR_COLUMNS)
+
+
+def editor_to_broker_rules(edited: pd.DataFrame) -> dict:
+    """
+    Editable table -> the broker_rules block.
+
+    '% of capital' takes a percentage 1-100. 'From FIX (CR)' takes the
+    multiplier applied to the FIX value (1,00,000 means FIX 1 -> 1,00,000).
+    """
+    out: dict = {}
+    seen: set = set()
+    for _, row in edited.iterrows():
+        name = str(row.get(BROKER_EDITOR_NAME, "")).strip().upper()
+        if not name or name in ("NAN", "NONE"):
+            continue
+        if name in seen:
+            raise AllocationRulesError(f"Broker '{name}' appears more than once.")
+        seen.add(name)
+
+        label = str(row.get(BROKER_EDITOR_METHOD, BROKER_LABEL_PCT)).strip()
+        raw = row.get(BROKER_EDITOR_VALUE)
+        if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+            raise AllocationRulesError(f"Broker '{name}' has a blank value.")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise AllocationRulesError(
+                f"Broker '{name}' value {raw!r} is not a number."
+            ) from exc
+
+        if label == BROKER_LABEL_FIX:
+            if value <= 0:
+                raise AllocationRulesError(
+                    f"Broker '{name}' multiplier must be positive, got {value:g}."
+                )
+            out[name] = {"method": BROKER_METHOD_FIX,
+                         "multiplier": int(value) if value.is_integer() else value}
+        else:
+            if value <= 0 or value > 100:
+                raise AllocationRulesError(
+                    f"Broker '{name}' percentage must be between 1 and 100, got {value:g}."
+                )
+            if 0 < value < 1:
+                raise AllocationRulesError(
+                    f"Broker '{name}' percentage {value:g} reads as {value:g}% of "
+                    f"capital. If you meant {value * 100:g}%, enter {value * 100:g}."
+                )
+            out[name] = {"method": BROKER_METHOD_CAPITAL_PCT,
+                         "pct": int(value) if value.is_integer() else value}
     return out
 
 
@@ -689,6 +827,259 @@ def build_previous_day_check(
 
 
 # -----------------------------
+# 0 SL MAX-LOSS CHECK
+# -----------------------------
+def zero_sl_config(rules: dict) -> dict:
+    """0 SL settings with safe defaults if the block is absent."""
+    cfg = rules.get("zero_sl", {}) or {}
+    return {
+        "enabled": cfg.get("enabled", True),
+        "sl_column": cfg.get("sl_column", SL_COL),
+        "max_loss_multiplier": cfg.get("max_loss_multiplier", 30),
+    }
+
+
+def coerce_sl(series: pd.Series) -> pd.Series:
+    """
+    Coerce the SL column to numeric.
+
+    Accepts 0, 0.0, "0", " 0 " and "0%". Blank cells and non-numeric text
+    become NaN so they are never treated as zero.
+    """
+    cleaned = series.astype(str).str.strip().str.rstrip("%").str.strip()
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
+def build_zero_sl_check(in_scope: pd.DataFrame, rules: dict) -> pd.DataFrame:
+    """
+    Accounts running with zero stop-loss must satisfy:
+
+        max_loss = allocation x max_loss_multiplier   (default 30)
+
+    This checks MAX LOSS, not allocation, so it runs alongside the allocation
+    rules rather than replacing them. A blank SL cell means 'no SL recorded'
+    and is not checked.
+    """
+    cfg = zero_sl_config(rules)
+    empty = pd.DataFrame(columns=ZERO_SL_COLUMNS)
+    if not cfg["enabled"] or in_scope.empty:
+        return empty
+
+    sl_col = cfg["sl_column"]
+    if sl_col not in in_scope.columns:
+        logger.warning(
+            "No '%s' column in the All Users sheet -- the 0 SL check did not run.",
+            sl_col,
+        )
+        return empty
+    if "max_loss" not in in_scope.columns:
+        logger.warning("No 'max_loss' column -- the 0 SL check did not run.")
+        return empty
+
+    sl_numeric = coerce_sl(in_scope[sl_col])
+    work = in_scope[sl_numeric == 0].copy()
+    if work.empty:
+        logger.info("0 SL check: no accounts with a zero SL in scope.")
+        return empty
+
+    work["sl"] = sl_numeric[work.index]
+    for col in ("alias", "operator_name"):
+        if col not in work.columns:
+            work[col] = ""
+    if "algo" not in work.columns:
+        work["algo"] = np.nan
+    work[SUBCATEGORY_COL] = (
+        work[SUBCATEGORY_COL].map(normalize_subcategory)
+        if SUBCATEGORY_COL in work.columns else ""
+    )
+
+    work["allocation"] = pd.to_numeric(work["allocation"], errors="coerce")
+    work["max_loss"] = pd.to_numeric(work["max_loss"], errors="coerce")
+    work["expected_max_loss"] = work["allocation"] * cfg["max_loss_multiplier"]
+    work["difference"] = work["max_loss"] - work["expected_max_loss"]
+    both_blank = work["max_loss"].isna() & work["expected_max_loss"].isna()
+    work["status"] = np.where(
+        (work["expected_max_loss"] == work["max_loss"]) | both_blank,
+        STATUS_MATCH, STATUS_MISMATCH,
+    )
+
+    result = work[ZERO_SL_COLUMNS].sort_values(
+        ["status", "server", "userid"], ascending=[False, True, True]
+    ).reset_index(drop=True)
+    logger.info(
+        "0 SL check: %d account(s) with zero SL, %d match, %d mismatch "
+        "(max_loss = allocation x %s).",
+        len(result), int((result["status"] == STATUS_MATCH).sum()),
+        int((result["status"] == STATUS_MISMATCH).sum()), cfg["max_loss_multiplier"],
+    )
+    return result
+
+
+# -----------------------------
+# BROKER RULES
+# -----------------------------
+def broker_rules(rules: dict) -> dict:
+    """Broker rules keyed by upper-cased broker name."""
+    return {
+        str(k).strip().upper(): v
+        for k, v in (rules.get("broker_rules") or {}).items()
+        if str(k).strip()
+    }
+
+
+def split_broker_accounts(
+    df: pd.DataFrame, rules: dict
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Split into (accounts with a broker rule, everything else)."""
+    configured = broker_rules(rules)
+    empty = df.iloc[0:0].copy()
+    if not configured or df.empty or BROKER_COL not in df.columns:
+        if configured and BROKER_COL not in df.columns and not df.empty:
+            logger.warning(
+                "Broker rules are configured but the All Users sheet has no "
+                "'Broker' column -- broker rules were not applied."
+            )
+        return empty, df
+
+    key = df[BROKER_COL].map(lambda v: str(v).strip().upper() if v is not None else "")
+    mask = key.isin(configured)
+    if mask.any():
+        logger.info(
+            "Broker rules matched %d account(s) across %s.",
+            int(mask.sum()), sorted(set(key[mask])),
+        )
+    return df[mask].copy(), df[~mask].copy()
+
+
+def build_broker_check(
+    broker_accounts: pd.DataFrame, df_run: pd.DataFrame, rules: dict
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Apply per-broker rules.
+
+        capital_pct     expected = round(running_capital x pct%, basis) / divisor
+        fix_allocation  expected = FIX (CR) x multiplier
+
+    Outranks the FIX, Jainam and category rules; outranked only by excluded algos.
+
+    Returns (result, unresolved) where unresolved holds accounts whose rule
+    could not be applied -- no capital, or no FIX value -- reported rather than
+    given an invented expectation.
+    """
+    empty_result = pd.DataFrame(columns=BROKER_COLUMNS)
+    if broker_accounts.empty:
+        return empty_result, broker_accounts.copy()
+
+    configured = broker_rules(rules)
+    basis = rules["rounding"]["basis"]
+    divisor = rules["rounding"]["divisor"]
+    round_mode = rules["rounding"].get("mode", "half_up")
+
+    work = broker_accounts.copy()
+    for col in ("alias", "operator_name"):
+        if col not in work.columns:
+            work[col] = ""
+    if "algo" not in work.columns:
+        work["algo"] = np.nan
+    if SUBCATEGORY_COL in work.columns:
+        work[SUBCATEGORY_COL] = work[SUBCATEGORY_COL].map(normalize_subcategory)
+    else:
+        work[SUBCATEGORY_COL] = ""
+
+    work[BROKER_COL] = work[BROKER_COL].map(
+        lambda v: str(v).strip().upper() if v is not None else ""
+    )
+    work["broker_rule"] = work[BROKER_COL].map(
+        lambda b: configured.get(b, {}).get("method", "")
+    )
+
+    # Capital comes from the Running file, deduplicated so it cannot multiply rows.
+    run = df_run[["userid", CAPITAL_COL]].drop_duplicates(subset=["userid"], keep="first")
+    before = len(work)
+    work = work.merge(run, on="userid", how="left")
+    if len(work) != before:
+        raise AllocationRulesError(
+            f"Broker capital join changed the row count ({before} -> {len(work)})."
+        )
+    work[CAPITAL_COL] = pd.to_numeric(work[CAPITAL_COL], errors="coerce")
+
+    fix_col = fix_config(rules)["column"]
+    work["fix_cr"] = (
+        pd.to_numeric(work[fix_col], errors="coerce") if fix_col in work.columns
+        else np.nan
+    )
+    work["actual_allocation"] = pd.to_numeric(work["allocation"], errors="coerce")
+
+    work["pct"] = np.nan
+    work["category_capital"] = np.nan
+    work["rounded_capital"] = np.nan
+    work["expected_allocation"] = np.nan
+    work["_reason"] = ""
+
+    is_pct = work["broker_rule"] == BROKER_METHOD_CAPITAL_PCT
+    if is_pct.any():
+        pct = work.loc[is_pct, BROKER_COL].map(
+            lambda b: float(configured[b].get("pct", 0))
+        )
+        work.loc[is_pct, "pct"] = pct
+        usable = is_pct & work[CAPITAL_COL].notna() & (work[CAPITAL_COL] > 0)
+        work.loc[usable, "category_capital"] = (
+            work.loc[usable, CAPITAL_COL] * work.loc[usable, "pct"].map(pct_fraction)
+        )
+        work.loc[usable, "rounded_capital"] = round_to_basis(
+            work.loc[usable, "category_capital"], basis, round_mode
+        )
+        work.loc[usable, "expected_allocation"] = work.loc[usable, "rounded_capital"] / divisor
+        work.loc[is_pct & ~usable, "_reason"] = (
+            "Broker rule needs running capital, which is missing or <= 0"
+        )
+
+    is_fix = work["broker_rule"] == BROKER_METHOD_FIX
+    if is_fix.any():
+        mult = work.loc[is_fix, BROKER_COL].map(
+            lambda b: float(configured[b].get("multiplier", 100_000))
+        )
+        usable = is_fix & work["fix_cr"].notna() & (work["fix_cr"] > 0)
+        work.loc[usable, "expected_allocation"] = work.loc[usable, "fix_cr"] * mult[usable]
+        work.loc[is_fix & ~usable, "_reason"] = (
+            "Broker rule needs a FIX (CR) value, which is missing"
+        )
+
+    unknown_method = ~is_pct & ~is_fix
+    if unknown_method.any():
+        work.loc[unknown_method, "_reason"] = "Broker rule method not recognised"
+
+    unresolved = work[work["expected_allocation"].isna()].copy()
+    if not unresolved.empty:
+        logger.warning(
+            "Broker rules: %d account(s) could not be resolved: %s",
+            len(unresolved),
+            sorted({f"{u} ({r})" for u, r in
+                    zip(unresolved["userid"], unresolved["_reason"])}),
+        )
+
+    resolved = work[work["expected_allocation"].notna()].copy()
+    if resolved.empty:
+        return empty_result, unresolved
+
+    resolved["difference"] = resolved["actual_allocation"] - resolved["expected_allocation"]
+    resolved["status"] = np.where(
+        resolved["expected_allocation"] == resolved["actual_allocation"],
+        STATUS_MATCH, STATUS_MISMATCH,
+    )
+    result = resolved[BROKER_COLUMNS].sort_values(
+        ["status", BROKER_COL, "userid"], ascending=[False, True, True]
+    ).reset_index(drop=True)
+
+    logger.info(
+        "Broker check: %d account(s) checked, %d match, %d mismatch, %d unresolved.",
+        len(result), int((result["status"] == STATUS_MATCH).sum()),
+        int((result["status"] == STATUS_MISMATCH).sum()), len(unresolved),
+    )
+    return result, unresolved
+
+
+# -----------------------------
 # EXCLUDED ALGOS
 # -----------------------------
 def normalize_subcategory(value) -> str:
@@ -745,6 +1136,15 @@ def excluded_algo_keys(rules: dict) -> set:
     }
 
 
+def jainam_subcategories(rules: dict) -> set:
+    """SubCategory names checked against the Jainam sheet (action 'jexception')."""
+    return {
+        str(name).strip().upper()
+        for name, cfg in rules.get("subcategories", {}).items()
+        if isinstance(cfg, dict) and cfg.get("action") == "jexception"
+    }
+
+
 def split_excluded_algos(
     df: pd.DataFrame, rules: dict
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -753,6 +1153,11 @@ def split_excluded_algos(
 
     Excluded algos stay in scope and are reported as 'Not under check' rather
     than being dropped, so a skipped account is always visible.
+
+    Jainam-type accounts (SubCategory action 'jexception', currently MSJ) are
+    EXEMPT: they are still checked against the Jainam sheet even when their
+    algo is excluded. Keyed off the action rather than the literal name so
+    renaming the SubCategory does not silently break the exemption.
     """
     keys = excluded_algo_keys(rules)
     empty = df.iloc[0:0].copy()
@@ -760,6 +1165,18 @@ def split_excluded_algos(
         return empty, df
 
     mask = df["algo"].map(algo_key).isin(keys)
+
+    exempt_subs = jainam_subcategories(rules)
+    if exempt_subs and SUBCATEGORY_COL in df.columns:
+        is_jainam = df[SUBCATEGORY_COL].map(normalize_subcategory).isin(exempt_subs)
+        exempted = int((mask & is_jainam).sum())
+        if exempted:
+            logger.info(
+                "Excluded algos: %d Jainam-type account(s) (%s) exempted and still "
+                "checked against the Jainam sheet.", exempted, sorted(exempt_subs),
+            )
+        mask &= ~is_jainam
+
     if mask.any():
         logger.info(
             "Excluded algos %s: %d account(s) skipped by every rule.",
@@ -772,12 +1189,20 @@ def split_excluded_algos(
 # FIX (CR) EXCEPTION
 # -----------------------------
 def fix_config(rules: dict) -> dict:
-    """FIX settings with safe defaults if the block is absent."""
+    """
+    FIX settings with safe defaults if the block is absent.
+
+    capital_multiplier converts the FIX (CR) figure into a capital amount:
+    FIX 1 -> 1,00,00,000. The legacy key `multiplier` is still read so an old
+    rules file does not silently fall back to a default.
+    """
     cfg = rules.get("fix", {}) or {}
     return {
         "enabled": cfg.get("enabled", True),
         "column": cfg.get("column", FIX_CR_COL),
-        "multiplier": cfg.get("multiplier", 100_000),
+        "capital_multiplier": cfg.get(
+            "capital_multiplier", cfg.get("multiplier", 10_000_000)
+        ),
     }
 
 
@@ -815,28 +1240,76 @@ def split_fix_accounts(
     return df[fixed_mask].copy(), df[invalid_mask].copy(), df[~fixed_mask & ~invalid_mask].copy()
 
 
-def build_fix_check(fix_accounts: pd.DataFrame, rules: dict) -> pd.DataFrame:
+def build_fix_check(
+    fix_accounts: pd.DataFrame, rules: dict
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Check fixed-allocation accounts.
+    Check fixed-capital accounts.
 
-        expected allocation = FIX (CR) x multiplier   (3 -> 3,00,000)
+    FIX (CR) fixes the account's CAPITAL rather than its allocation:
 
-    Highest-precedence rule: these accounts bypass the capital, previous-day
-    and Jainam checks entirely.
+        fixed_capital       = FIX (CR) x capital_multiplier    (1 -> 1,00,00,000)
+        category_capital    = fixed_capital x pct(SubCategory)
+        rounded             = round_half_up(category_capital, basis)
+        expected allocation = rounded / divisor
+
+    So FIX 1 on a 40% category gives 1,00,00,000 -> 40,00,000 -> 40,000.
+
+    Overrides the Running file's capital, the previous-day rule and the Jainam
+    rule, but not an excluded algo.
+
+    Returns (result, no_category) where no_category holds FIX accounts whose
+    SubCategory carries no percentage -- there is nothing to apply the fixed
+    capital to, so they are reported rather than given an invented number.
     """
+    empty_result = pd.DataFrame(columns=FIX_COLUMNS)
     if fix_accounts.empty:
-        return pd.DataFrame(columns=FIX_COLUMNS)
+        return empty_result, fix_accounts.copy()
 
     cfg = fix_config(rules)
     work = fix_accounts.copy()
-    for col in ("alias", SUBCATEGORY_COL, "operator_name"):
+    for col in ("alias", "operator_name"):
         if col not in work.columns:
             work[col] = ""
     if "algo" not in work.columns:
         work["algo"] = np.nan
 
+    work[SUBCATEGORY_COL] = work[SUBCATEGORY_COL].map(normalize_subcategory)
+    sub_rules = {str(k).strip().upper(): v for k, v in rules["subcategories"].items()}
+
+    def _pct(sub: str):
+        cfg_sub = sub_rules.get(sub, {})
+        if cfg_sub.get("action") != "check":
+            return np.nan
+        pct = cfg_sub.get("pct")
+        return float(pct) if isinstance(pct, (int, float)) and not isinstance(pct, bool) \
+            else np.nan
+
+    work["pct"] = work[SUBCATEGORY_COL].map(_pct)
+
+    no_category = work[work["pct"].isna()].copy()
+    if not no_category.empty:
+        logger.warning(
+            "FIX check: %d account(s) have no category percentage and were not "
+            "checked: %s",
+            len(no_category),
+            sorted({f"{u} ({s or '<blank>'})" for u, s
+                    in zip(no_category["userid"], no_category[SUBCATEGORY_COL])}),
+        )
+
+    work = work[work["pct"].notna()].copy()
+    if work.empty:
+        return empty_result, no_category
+
+    basis = rules["rounding"]["basis"]
+    divisor = rules["rounding"]["divisor"]
+    round_mode = rules["rounding"].get("mode", "half_up")
+
     work["fix_cr"] = pd.to_numeric(work[cfg["column"]], errors="coerce")
-    work["expected_allocation"] = work["fix_cr"] * cfg["multiplier"]
+    work["fixed_capital"] = work["fix_cr"] * cfg["capital_multiplier"]
+    work["category_capital"] = work["fixed_capital"] * work["pct"].map(pct_fraction)
+    work["rounded_capital"] = round_to_basis(work["category_capital"], basis, round_mode)
+    work["expected_allocation"] = work["rounded_capital"] / divisor
     work["actual_allocation"] = pd.to_numeric(work["allocation"], errors="coerce")
     work["difference"] = work["actual_allocation"] - work["expected_allocation"]
     work["status"] = np.where(
@@ -848,11 +1321,12 @@ def build_fix_check(fix_accounts: pd.DataFrame, rules: dict) -> pd.DataFrame:
         ["status", "userid"], ascending=[False, True]
     ).reset_index(drop=True)
     logger.info(
-        "FIX check: %d account(s), %d match, %d mismatch.",
+        "FIX check: %d account(s) checked, %d match, %d mismatch, %d without a "
+        "category percentage.",
         len(result), int((result["status"] == STATUS_MATCH).sum()),
-        int((result["status"] == STATUS_MISMATCH).sum()),
+        int((result["status"] == STATUS_MISMATCH).sum()), len(no_category),
     )
-    return result
+    return result, no_category
 
 
 # -----------------------------
@@ -1066,6 +1540,10 @@ def build_allocation_check(
             "jainam_result": pd.DataFrame(columns=JAINAM_COLUMNS),
             "fix_result": pd.DataFrame(columns=FIX_COLUMNS),
             "fix_invalid": pd.DataFrame(columns=display_cols),
+            "fix_no_category": pd.DataFrame(columns=display_cols),
+            "broker_result": pd.DataFrame(columns=BROKER_COLUMNS),
+            "broker_unresolved": pd.DataFrame(columns=display_cols),
+            "zero_sl_result": zero_sl_result,
             "excluded_algo": pd.DataFrame(columns=display_cols),
             "not_in_running": pd.DataFrame(columns=display_cols),
             "no_capital": pd.DataFrame(columns=display_cols),
@@ -1081,12 +1559,20 @@ def build_allocation_check(
         logger.warning("Allocation Check %s: no accounts in scope.", mode)
         return _tables()
 
+    # --- 0 SL max-loss check: runs alongside the allocation rules, not instead
+    # of them, so an account may appear here AND on its allocation rule.
+    zero_sl_result = build_zero_sl_check(in_scope, rules)
+
     # --- 0a. excluded algos: skipped by every rule, but kept visible ---
     excluded_algo, after_algo = split_excluded_algos(in_scope, rules)
 
-    # --- 0b. FIX (CR) exception: overrides Jainam, capital and previous-day ---
-    fix_accounts, fix_invalid, remaining = split_fix_accounts(after_algo, rules)
-    fix_result = build_fix_check(fix_accounts, rules)
+    # --- 0b. broker rules: outrank FIX, Jainam and category ---
+    broker_accounts, after_broker = split_broker_accounts(after_algo, rules)
+    broker_result, broker_unresolved = build_broker_check(broker_accounts, df_run, rules)
+
+    # --- 0c. FIX (CR) exception: overrides Jainam, capital and previous-day ---
+    fix_accounts, fix_invalid, remaining = split_fix_accounts(after_broker, rules)
+    fix_result, fix_no_category = build_fix_check(fix_accounts, rules)
 
     # --- 1. classify by SubCategory (JA is extracted before any routing) ---
     work = remaining.copy()
@@ -1139,6 +1625,10 @@ def build_allocation_check(
             jainam_result=jainam_result,
             fix_result=fix_result,
             fix_invalid=_slice(fix_invalid),
+            fix_no_category=_slice(fix_no_category),
+            broker_result=broker_result,
+            broker_unresolved=_slice(broker_unresolved),
+            zero_sl_result=zero_sl_result,
             excluded_algo=_slice(excluded_algo),
             not_in_running=_slice(not_in_running),
             no_capital=_slice(no_capital),
@@ -1304,15 +1794,39 @@ def build_consolidated(
         part["remark"] = "Not present in the previous day's All Users sheet"
         parts.append(part)
 
+    # --- broker rules ---
+    broker = tables.get("broker_result", pd.DataFrame())
+    if not broker.empty:
+        part = base(broker)
+        part["rule"] = [
+            f"{RULE_BROKER} {b} {p:g}%" if m == BROKER_METHOD_CAPITAL_PCT and pd.notna(p)
+            else f"{RULE_BROKER} {b} Fixed"
+            for b, m, p in zip(broker[BROKER_COL], broker["broker_rule"], broker["pct"])
+        ]
+        part["allocation"] = broker["actual_allocation"]
+        part["expected allocation"] = broker["expected_allocation"]
+        part["category capital"] = broker["category_capital"]
+        part["capital"] = broker[CAPITAL_COL]
+        part["status"] = broker["status"]
+        part["remark"] = np.where(
+            broker["status"] == STATUS_MATCH, "",
+            "Allocation differs from the broker rule",
+        )
+        parts.append(part)
+
     # --- FIX (CR) exception ---
     fix = tables.get("fix_result", pd.DataFrame())
     if not fix.empty:
         part = base(fix)
-        part["rule"] = RULE_FIX
+        # Show the percentage alongside, since FIX now runs the category rule
+        # on a fixed capital rather than setting the allocation directly.
+        part["rule"] = fix["pct"].map(
+            lambda p: f"{RULE_FIX} {p:g}%" if pd.notna(p) else RULE_FIX
+        )
         part["allocation"] = fix["actual_allocation"]
         part["expected allocation"] = fix["expected_allocation"]
-        part["category capital"] = np.nan
-        part["capital"] = np.nan
+        part["category capital"] = fix["category_capital"]
+        part["capital"] = fix["fixed_capital"]
         part["status"] = fix["status"]
         part["remark"] = np.where(
             fix["status"] == STATUS_MATCH, "",
@@ -1336,7 +1850,9 @@ def build_consolidated(
     # --- everything in scope but not checked ---
     not_checked = [
         ("excluded_algo", "Algo excluded by rule"),
+        ("broker_unresolved", "Broker rule could not be resolved (no capital or no FIX value)"),
         ("fix_invalid", "FIX (CR) value is unusable (0, negative or non-numeric)"),
+        ("fix_no_category", "FIX account has no category percentage"),
         ("unknown_subcategory", "SubCategory not defined in the rules file"),
         ("excluded", "SubCategory excluded by rule"),
         ("not_in_running", "Not present in the Running file"),
@@ -1373,6 +1889,197 @@ def build_consolidated(
     return combined[CONSOLIDATED_COLUMNS]
 
 
+# -----------------------------
+# EXPORT LAYOUT (one sheet per rule)
+# -----------------------------
+# Exactly the columns requested by the business, in order, with `remark` last
+# so the Not Checked sheet can say WHY an account was skipped.
+EXPORT_COLUMNS = [
+    "userid", "alias", "server", "algo", "Rule", "sub category",
+    "pct", "capital", "category_capital", "rounded_capital",
+    "expected_allocation", "actual_allocation", "difference", "status",
+    "operator_name", "remark",
+]
+
+# Sheet order. Every sheet is always written, even when empty, so the workbook
+# has a stable shape day to day.
+EXPORT_RULES = [
+    "Previous Day", "Category", "Broker", "Algo", "Jainam", "Fixed", "Not Checked",
+]
+
+
+def build_export(tables: Dict[str, pd.DataFrame], in_scope: pd.DataFrame) -> pd.DataFrame:
+    """
+    One row per in-scope account with a `Rule` column, in the export layout.
+
+    This is the single source for the downloaded workbook: the Summary sheet is
+    this frame, and each rule sheet is a filter on `Rule`.
+    """
+    def frame(source: pd.DataFrame, rule: str, **cols) -> pd.DataFrame:
+        if source is None or source.empty:
+            return pd.DataFrame(columns=EXPORT_COLUMNS)
+        out = pd.DataFrame(index=source.index)
+        out["userid"] = source.get("userid", "")
+        out["alias"] = source.get("alias", "")
+        out["server"] = source.get("server", "")
+        out["algo"] = source.get("algo", np.nan)
+        out["Rule"] = rule
+        out["sub category"] = source.get(SUBCATEGORY_COL, "")
+        out["operator_name"] = source.get("operator_name", "")
+        for name in ("pct", "capital", "category_capital", "rounded_capital",
+                     "expected_allocation", "actual_allocation", "difference",
+                     "status", "remark"):
+            value = cols.get(name)
+            if value is None:
+                out[name] = "" if name in ("status", "remark") else np.nan
+            else:
+                out[name] = value
+        return out[EXPORT_COLUMNS]
+
+    parts: List[pd.DataFrame] = []
+
+    cap = tables.get("result", pd.DataFrame())
+    parts.append(frame(
+        cap, "Category",
+        pct=cap.get("pct"), capital=cap.get(CAPITAL_COL),
+        category_capital=cap.get("category_capital"),
+        rounded_capital=cap.get("rounded_capital"),
+        expected_allocation=cap.get("expected_allocation"),
+        actual_allocation=cap.get("actual_allocation"),
+        difference=cap.get("difference"), status=cap.get("status"),
+    ))
+
+    fix = tables.get("fix_result", pd.DataFrame())
+    parts.append(frame(
+        fix, "Fixed",
+        pct=fix.get("pct"), capital=fix.get("fixed_capital"),
+        category_capital=fix.get("category_capital"),
+        rounded_capital=fix.get("rounded_capital"),
+        expected_allocation=fix.get("expected_allocation"),
+        actual_allocation=fix.get("actual_allocation"),
+        difference=fix.get("difference"), status=fix.get("status"),
+        remark="Capital fixed from the FIX (CR) column",
+    ))
+
+    brk = tables.get("broker_result", pd.DataFrame())
+    if not brk.empty:
+        is_fix_method = brk["broker_rule"] == BROKER_METHOD_FIX
+        # A fix_allocation broker derives the allocation straight from FIX (CR)
+        # and never touches the running capital. Showing that capital would
+        # imply it fed the calculation, so blank it and name the driver in the
+        # remark instead -- otherwise the number is untraceable.
+        broker_capital = brk[CAPITAL_COL].where(~is_fix_method)
+        broker_remark = [
+            f"{b} - from FIX (CR) {f:g}" if m == BROKER_METHOD_FIX and pd.notna(f)
+            else (f"{b} - from FIX (CR)" if m == BROKER_METHOD_FIX else str(b))
+            for b, m, f in zip(brk[BROKER_COL], brk["broker_rule"], brk["fix_cr"])
+        ]
+    else:
+        broker_capital, broker_remark = None, None
+    parts.append(frame(
+        brk, "Broker",
+        pct=brk.get("pct"), capital=broker_capital,
+        category_capital=brk.get("category_capital"),
+        rounded_capital=brk.get("rounded_capital"),
+        expected_allocation=brk.get("expected_allocation"),
+        actual_allocation=brk.get("actual_allocation"),
+        difference=brk.get("difference"), status=brk.get("status"),
+        remark=broker_remark,
+    ))
+
+    jai = tables.get("jainam_result", pd.DataFrame())
+    parts.append(frame(
+        jai, "Jainam",
+        expected_allocation=jai.get("expected_allocation"),
+        actual_allocation=jai.get("actual_allocation"),
+        difference=jai.get("difference"), status=jai.get("status"),
+        remark=jai.get("remark"),
+    ))
+
+    prev = tables.get("prevday_result", pd.DataFrame())
+    parts.append(frame(
+        prev, "Previous Day",
+        expected_allocation=prev.get("previous_allocation"),
+        actual_allocation=prev.get("today_allocation"),
+        difference=prev.get("difference"), status=prev.get("status"),
+        remark="Compared against the previous day's allocation",
+    ))
+
+    new = tables.get("prevday_new", pd.DataFrame())
+    parts.append(frame(
+        new, "Previous Day",
+        actual_allocation=new.get("today_allocation"),
+        status=STATUS_NEW_USER,
+        remark="Not present in the previous day's All Users sheet",
+    ))
+
+    algo = tables.get("algo_result", pd.DataFrame())
+    if algo is not None and not algo.empty:
+        parts.append(frame(
+            algo, "Algo",
+            pct=algo.get("pct"), capital=algo.get(CAPITAL_COL),
+            category_capital=algo.get("category_capital"),
+            rounded_capital=algo.get("rounded_capital"),
+            expected_allocation=algo.get("expected_allocation"),
+            actual_allocation=algo.get("actual_allocation"),
+            difference=algo.get("difference"), status=algo.get("status"),
+        ))
+
+    for key, reason in (
+        ("excluded_algo", "Algo excluded by rule"),
+        ("broker_unresolved", "Broker rule could not be resolved (no capital or no FIX value)"),
+        ("fix_invalid", "FIX (CR) value is unusable (0, negative or non-numeric)"),
+        ("fix_no_category", "FIX account has no category percentage"),
+        ("unknown_subcategory", "SubCategory not defined in the rules file"),
+        ("excluded", "SubCategory excluded by rule"),
+        ("not_in_running", "Not present in the Running file"),
+        ("no_capital", "Capital is blank or <= 0 in the Running file"),
+        ("unroutable", "Matched no routing rule for this mode"),
+    ):
+        src = tables.get(key, pd.DataFrame())
+        parts.append(frame(
+            src, "Not Checked",
+            actual_allocation=pd.to_numeric(src.get("allocation"), errors="coerce")
+            if src is not None and not src.empty else None,
+            status=STATUS_NOT_CHECKED, remark=reason,
+        ))
+
+    parts = [p for p in parts if not p.empty]
+    if not parts:
+        return pd.DataFrame(columns=EXPORT_COLUMNS)
+
+    combined = pd.concat(parts, ignore_index=True)
+    order = {STATUS_MISMATCH: 0, STATUS_NEW_USER: 1, STATUS_NOT_CHECKED: 2, STATUS_MATCH: 3}
+    combined["_o"] = combined["status"].map(order).fillna(9)
+    combined = (
+        combined.sort_values(["_o", "Rule", "sub category", "userid"])
+        .drop(columns=["_o"]).reset_index(drop=True)
+    )
+    return combined[EXPORT_COLUMNS]
+
+
+def export_sheets(
+    export: pd.DataFrame, zero_sl: Optional[pd.DataFrame] = None
+) -> Dict[str, pd.DataFrame]:
+    """
+    Summary plus one sheet per rule, in a fixed order.
+
+    The 0 SL sheet is appended last and has its own columns: it checks max_loss
+    rather than allocation, so it is not part of the one-row-per-account
+    Summary and an account may legitimately appear on both.
+    """
+    sheets = {"Summary": export}
+    for rule in EXPORT_RULES:
+        sheets[rule] = (
+            export[export["Rule"] == rule].reset_index(drop=True)
+            if not export.empty else pd.DataFrame(columns=EXPORT_COLUMNS)
+        )
+    sheets[RULE_ZERO_SL] = (
+        zero_sl if zero_sl is not None else pd.DataFrame(columns=ZERO_SL_COLUMNS)
+    )
+    return sheets
+
+
 def consolidated_status_counts(consolidated: pd.DataFrame) -> pd.DataFrame:
     """Row counts per status, for the metric strip above the table."""
     if consolidated.empty:
@@ -1403,6 +2110,9 @@ def reconcile(scoped_total: int, tables: Dict[str, pd.DataFrame]) -> Tuple[bool,
         + len(tables.get("jainam_result", []))
         + len(tables.get("fix_result", []))
         + len(tables.get("fix_invalid", []))
+        + len(tables.get("fix_no_category", []))
+        + len(tables.get("broker_result", []))
+        + len(tables.get("broker_unresolved", []))
         + len(tables.get("excluded_algo", []))
         + len(tables.get("unroutable", []))
     )

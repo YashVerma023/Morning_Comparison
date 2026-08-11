@@ -7,12 +7,29 @@
     "divisor": 100,
     "_comment": "category_capital is rounded to the nearest `basis` (20,00,000) with halves going UP, then divided by `divisor` to give the expected allocation. mode must be one of: half_up, floor, ceil. half_up is deliberate: Python/numpy round() rounds halves to even, which turns 90,00,000 into 80,00,000 instead of 1,00,00,000."
   },
+  "zero_sl": {
+    "enabled": true,
+    "sl_column": "sl",
+    "max_loss_multiplier": 30
+  },
+  "_zero_sl_comment": "Accounts with a numeric ZERO in the All Users 'SL' column must satisfy max_loss = allocation x max_loss_multiplier. This checks MAX LOSS, not allocation, so it runs alongside the allocation rules rather than replacing them -- an account can appear on both its allocation rule sheet and the 0 SL sheet. A blank SL cell means 'no SL recorded' and is NOT checked. Scoped to the active DTE mode like every other rule.",
+  "broker_rules": {
+    "EXCELSTOCK": {
+      "method": "capital_pct",
+      "pct": 25
+    },
+    "VMATHRAMCO": {
+      "method": "fix_allocation",
+      "multiplier": 100000
+    }
+  },
+  "_broker_rules_comment": "Per-broker overrides, matched on the All Users 'Broker' column (case-insensitive, exact name). Broker rules OUTRANK the FIX, Jainam and category rules, and are themselves outranked only by excluded_algos. method 'capital_pct' takes pct% of the Running file's capital and runs it through the normal rounding (EXCELSTOCK: 25%). method 'fix_allocation' derives the allocation straight from the FIX (CR) column: FIX 1 -> 1,00,000 (VMATHRAMCO). An account whose broker rule cannot be resolved -- no capital, or no FIX value -- is reported as 'Not under check' rather than being given an invented number. Editable from the app's Allocation Check screen.",
   "fix": {
     "enabled": true,
     "column": "fix_cr",
-    "multiplier": 100000
+    "capital_multiplier": 10000000
   },
-  "_fix_comment": "Accounts with a positive value in the All Users 'FIX (CR)' column are a fixed-allocation exception: expected allocation = FIX (CR) x multiplier (3 -> 3,00,000). This has the HIGHEST precedence -- it overrides the capital rule, the previous-day rule AND the Jainam (JA) rule. A blank cell means the account is not fixed and follows the normal path. A populated but unusable value (0, negative, or text) is reported as 'Not under check' rather than silently falling through.",
+  "_fix_comment": "A positive value in the All Users 'FIX (CR)' column FIXES THE ACCOUNT'S CAPITAL instead of using the Running file's capital. FIX 1 means capital = 1,00,00,000 (capital_multiplier). The account's SubCategory percentage is then applied exactly as in the normal capital rule: fixed_capital x pct, rounded half-up to the rounding basis, divided by the divisor. So FIX 1 on a 40% category gives 1,00,00,000 -> 40,00,000 -> allocation 40,000. This overrides the running capital, the previous-day rule and the Jainam rule, but NOT an excluded algo. A blank cell means the account is not fixed. A populated but unusable value (0, negative, text) is reported as 'Not under check'. A FIX account whose SubCategory has no percentage (Jainam type, excluded, or unmapped) is also reported as 'Not under check' -- there is nothing to apply the fixed capital to.",
   "jainam": {
     "sheet_name": "Jainam",
     "userid_column": "UserID",
@@ -30,8 +47,12 @@
     "not running"
   ],
   "_excluded_servers_comment": "Matched case-insensitively against the All Users `server` column. These accounts are never checked in any DTE mode.",
-  "excluded_algos": [],
-  "_excluded_algos_comment": "Algos listed here are skipped by every Allocation Check rule. They remain IN SCOPE and appear in the All Accounts table with status 'Not under check' and the remark 'Algo excluded by rule', so nothing disappears silently. Values are compared numerically, so 8, 8.0 and \"8\" all match. This exclusion has the highest precedence -- it applies before the FIX, Jainam, capital and previous-day rules. Editable from the app's Allocation Check screen.",
+  "excluded_algos": [
+    8,
+    19,
+    27
+  ],
+  "_excluded_algos_comment": "Algos listed here are skipped by every Allocation Check rule. They remain IN SCOPE and appear with status 'Not under check' and the remark 'Algo excluded by rule', so nothing disappears silently. Values are compared numerically, so 8, 8.0 and \"8\" all match. EXCEPTION: Jainam-type accounts (any SubCategory whose action is 'jexception', currently MSJ) are exempt -- they are still checked against the Jainam sheet even when their algo is excluded. Apart from that exemption this has the highest precedence, applying before the broker, FIX, Jainam, capital and previous-day rules. Editable from the app's Allocation Check screen.",
   "dte_filters": {
     "0DTE": {
       "runningtype": null,
@@ -184,6 +205,10 @@
     "MSJ": {
       "action": "jexception",
       "reason": "Checked against the Jainam sheet"
+    },
+    "MSRG": {
+      "action": "check",
+      "pct": 100
     }
   },
   "_subcategories_comment": "pct is a WHOLE PERCENT of running capital: 100 = 100%, 60 = 60%, 20 = 20%. pct 0 means the SubCategory is EXCLUDED from the check. Do NOT write 0.6 for 60% -- a value between 0 and 1 is rejected as a likely fraction mistake. action must be one of: check (needs pct), exclude, jexception (checked against the Jainam sheet instead). Any SubCategory found in the sheet but absent from this map is reported in the 'Unknown SubCategory' table and is never silently dropped. This section is editable from the app's Allocation Check screen."
