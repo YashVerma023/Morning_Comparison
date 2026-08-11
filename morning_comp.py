@@ -1290,6 +1290,30 @@ def render_allocation_check(mode: str) -> None:
                 except ac.AllocationRulesError as exc:
                     st.error(f"Not added -- {exc}")
 
+        st.markdown("**Rounding**")
+        r1, r2 = st.columns([1, 2])
+        basis_value = r1.number_input(
+            "Round capital to the nearest",
+            min_value=1,
+            value=int(rules["rounding"]["basis"]),
+            step=100_000,
+            format="%d",
+            key="rounding_basis_input",
+            help=(
+                "Category capital is rounded to a multiple of this before being "
+                "divided by 100. Default 20,00,000."
+            ),
+        )
+        r2.caption(
+            f"Currently **{format_indian(basis_value)}**  \n"
+            f"Mode: `{rules['rounding']['mode']}` (exact halves round up) - "
+            f"divisor: `{rules['rounding']['divisor']}`  \n"
+            f"e.g. category capital {format_indian(11_322_199)} -> "
+            f"{format_indian(float(ac.round_to_basis(pd.Series([11_322_199]), basis_value, rules['rounding']['mode']).iloc[0]))}"
+            f" -> allocation "
+            f"{format_indian(float(ac.round_to_basis(pd.Series([11_322_199]), basis_value, rules['rounding']['mode']).iloc[0]) / rules['rounding']['divisor'])}"
+        )
+
         st.markdown("**Broker rules**")
         st.caption(
             "Per-broker overrides matched on the All Users **Broker** column. "
@@ -1335,6 +1359,7 @@ def render_allocation_check(mode: str) -> None:
                 updated["subcategories"] = ac.editor_to_subcategories(edited)
                 updated["broker_rules"] = ac.editor_to_broker_rules(broker_edited)
                 updated["excluded_algos"] = ac.parse_excluded_algos(algos_text)
+                updated["rounding"] = {**rules["rounding"], "basis": int(basis_value)}
                 path = ac.save_rules(updated)
                 st.success(f"Rules saved to `{path}`. Re-running the check.")
                 st.rerun()

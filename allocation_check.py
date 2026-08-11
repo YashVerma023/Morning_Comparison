@@ -38,6 +38,9 @@ RULES_PATH_ENV = "ALLOCATION_RULES_PATH"
 VALID_ACTIONS = {"check", "exclude", "jexception"}
 VALID_ROUNDING_MODES = {"half_up", "floor", "ceil"}
 
+# Fallback used only when the rules file has no rounding block at all.
+DEFAULT_ROUNDING_BASIS = 2_000_000
+
 # Check methods an account can be routed to.
 METHOD_CAPITAL = "capital"
 METHOD_PREVIOUS_DAY = "previous_day"
@@ -558,6 +561,34 @@ def format_excluded_algos(rules: dict) -> str:
     return ", ".join(str(a) for a in (rules.get("excluded_algos") or []))
 
 
+# Stable key order so a save from the UI keeps the file readable instead of
+# reshuffling it. Anything not listed is appended in its existing order.
+CONFIG_KEY_ORDER = [
+    "version", "_doc", "rounding", "excluded_servers", "excluded_algos",
+    "dte_filters", "previous_day", "routing", "subcategories", "broker_rules",
+    "fix", "jainam", "zero_sl",
+]
+
+
+def _tidy_rules(rules: dict) -> dict:
+    """
+    Order keys and drop legacy prose keys.
+
+    Documentation lives in config/README.md, so any leftover `_..._comment`
+    blobs from older versions are stripped on save rather than being carried
+    forward and re-cluttering the file.
+    """
+    cleaned = {
+        k: v for k, v in rules.items()
+        if not (k.startswith("_") and k.endswith("_comment"))
+    }
+    ordered = {k: cleaned[k] for k in CONFIG_KEY_ORDER if k in cleaned}
+    for key, value in cleaned.items():
+        if key not in ordered:
+            ordered[key] = value
+    return ordered
+
+
 def save_rules(rules: dict, path: Optional[str] = None) -> Path:
     """
     Validate then write the rules JSON, keeping a backup of the previous file.
@@ -567,6 +598,7 @@ def save_rules(rules: dict, path: Optional[str] = None) -> Path:
     """
     rules_path = resolve_rules_path(path)
     _validate_rules(rules, rules_path)
+    rules = _tidy_rules(rules)
 
     if rules_path.exists():
         backup = rules_path.with_suffix(".json.bak")
