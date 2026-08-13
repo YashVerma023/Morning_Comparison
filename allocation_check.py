@@ -1598,16 +1598,12 @@ def build_allocation_check(
     # --- 0a. excluded algos: skipped by every rule, but kept visible ---
     excluded_algo, after_algo = split_excluded_algos(in_scope, rules)
 
-    # --- 0b. broker rules: outrank FIX, Jainam and category ---
+    # --- 0b. broker rules: outrank Jainam, previous-day, FIX and category ---
     broker_accounts, after_broker = split_broker_accounts(after_algo, rules)
     broker_result, broker_unresolved = build_broker_check(broker_accounts, df_run, rules)
 
-    # --- 0c. FIX (CR) exception: overrides Jainam, capital and previous-day ---
-    fix_accounts, fix_invalid, remaining = split_fix_accounts(after_broker, rules)
-    fix_result, fix_no_category = build_fix_check(fix_accounts, rules)
-
-    # --- 1. classify by SubCategory (JA is extracted before any routing) ---
-    work = remaining.copy()
+    # --- 1. classify by SubCategory (Jainam is extracted before any routing) ---
+    work = after_broker.copy()
     # Element-wise rather than .astype(str).str.upper(): on a nullable dtype
     # (string[python], Float64) the .str accessor propagates NA instead of
     # stringifying it, leaving floats mixed in with strings downstream.
@@ -1630,10 +1626,12 @@ def build_allocation_check(
             "in the rules file: %s", mode, len(unknown), seen,
         )
 
-    # --- 2. JA accounts -> Jainam sheet ---
+    # --- 2. Jainam accounts (MSJ) -> Jainam sheet, ahead of previous-day ---
     jainam_result = build_jainam_check(ja_accounts, df_jainam, rules)
 
-    # --- 3. route the rest ---
+    # --- 3. route: previous-day outranks FIX, so routing happens BEFORE the
+    # FIX split. A POS account goes to the previous-day check even when it
+    # carries a FIX (CR) value.
     has_prev = df_prev is not None and not df_prev.empty
     routed, unroutable = route_accounts(checkable, mode, has_prev, rules)
 
@@ -1647,6 +1645,12 @@ def build_allocation_check(
                 "previous-day check, but no previous-day All Users sheet was provided."
             )
         prevday_result, prevday_new = build_previous_day_check(prevday_accounts, df_prev)
+
+    # --- 4. FIX applies only to what is left for the capital rule ---
+    fix_accounts, fix_invalid, capital_accounts = split_fix_accounts(
+        routed[METHOD_CAPITAL], rules
+    )
+    fix_result, fix_no_category = build_fix_check(fix_accounts, rules)
 
     def _finalise(result, not_in_running, no_capital) -> Dict[str, pd.DataFrame]:
         return _tables(
@@ -1669,11 +1673,10 @@ def build_allocation_check(
             unroutable=_slice(unroutable),
         )
 
-    capital_accounts = routed[METHOD_CAPITAL]
     if capital_accounts.empty:
         return _finalise(pd.DataFrame(columns=RESULT_COLUMNS), None, None)
 
-    # --- 4. capital rule ---
+    # --- 5. capital rule ---
     run = df_run[["userid", CAPITAL_COL]].copy()
     dup_run = int(run["userid"].duplicated().sum())
     if dup_run:

@@ -19,11 +19,18 @@ An account is checked by exactly **one** allocation rule. The first match wins:
 ```
 1. Excluded algo      →  not checked at all      (except MSJ, see below)
 2. Broker rule        →  EXCELSTOCK / VMATHRAMCO
-3. Fixed              →  account has a FIX (CR) value
-4. Jainam             →  SubCategory action 'jexception' (MSJ)
-5. Category           →  running capital × SubCategory %
-   or Previous Day    →  today's allocation vs yesterday's
+3. Jainam             →  SubCategory action 'jexception' (MSJ)
+4. Previous Day       →  POS accounts: today's allocation vs yesterday's
+5. Fixed              →  account has a FIX (CR) value
+6. Category           →  running capital × SubCategory %
 ```
+
+Previous Day sits **above** Fixed: a POS account is checked against yesterday
+even when it carries a FIX (CR) value. FIX therefore applies only to accounts
+routed to the capital rule.
+
+Jainam sits **above** Previous Day: a MSJ account goes to the Jainam sheet
+whether it is POS or INT.
 
 **0 SL is separate.** It checks `max_loss`, not allocation, so it runs
 *alongside* whichever rule above applied. An account can appear on both.
