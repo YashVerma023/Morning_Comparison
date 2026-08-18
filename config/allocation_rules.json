@@ -50,21 +50,23 @@
   "subcategories": {
     "CC":   { "action": "check", "pct": 100 },
     "CCG":  { "action": "check", "pct": 100 },
-    "CCV":  { "action": "check", "pct": 60 },
-    "MSS":  { "action": "check", "pct": 40 },
-    "MSV":  { "action": "check", "pct": 60 },
-    "MSR":  { "action": "check", "pct": 40 },
-    "MSP":  { "action": "check", "pct": 40 },
-    "MSN":  { "action": "check", "pct": 40 },
+    "CCV":  { "action": "check", "pct": 100 },
+    "MSS":  { "action": "check", "pct": 100 },
+    "MSV":  { "action": "check", "pct": 100 },
+    "MSR":  { "action": "check", "pct": 100 },
+    "MSP":  { "action": "check", "pct": 100 },
+    "MSN":  { "action": "check", "pct": 100 },
     "PVT":  { "action": "check", "pct": 100 },
     "PGB":  { "action": "check", "pct": 100 },
     "PPS":  { "action": "check", "pct": 100 },
+    "MS":  { "action": "check", "pct": 100 },
+    "MSRG":  { "action": "check", "pct": 100 },
     "PRD":  { "action": "exclude", "pct": 0 },
     "MSJ":  { "action": "jexception" }
   },
 
   "broker_rules": {
-    "EXCELSTOCK": { "method": "capital_pct", "pct": 25 },
+    "EXCELSTOCK": { "method": "capital_pct", "pct": 100 },
     "VMATHRAMCO": { "method": "fix_allocation", "multiplier": 100000 }
   },
 

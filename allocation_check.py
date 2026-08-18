@@ -1558,10 +1558,12 @@ def build_allocation_check(
     display_cols = ["userid", "alias", "server", "algo", SUBCATEGORY_COL,
                     "allocation", "operator_name"]
 
-    def _slice(frame: pd.DataFrame) -> pd.DataFrame:
+    def _slice(frame: pd.DataFrame, extra: Optional[List[str]] = None) -> pd.DataFrame:
+        cols = display_cols + [c for c in (extra or [])]
         if frame is None or frame.empty:
-            return pd.DataFrame(columns=display_cols)
-        return frame[display_cols].reset_index(drop=True)
+            return pd.DataFrame(columns=cols)
+        keep = [c for c in cols if c in frame.columns]
+        return frame[keep].reset_index(drop=True)
 
     def _tables(**kw) -> Dict[str, pd.DataFrame]:
         base = {
@@ -1663,7 +1665,7 @@ def build_allocation_check(
             fix_invalid=_slice(fix_invalid),
             fix_no_category=_slice(fix_no_category),
             broker_result=broker_result,
-            broker_unresolved=_slice(broker_unresolved),
+            broker_unresolved=_slice(broker_unresolved, extra=["_reason"]),
             zero_sl_result=zero_sl_result,
             excluded_algo=_slice(excluded_algo),
             not_in_running=_slice(not_in_running),
@@ -2072,11 +2074,16 @@ def build_export(tables: Dict[str, pd.DataFrame], in_scope: pd.DataFrame) -> pd.
         ("unroutable", "Matched no routing rule for this mode"),
     ):
         src = tables.get(key, pd.DataFrame())
+        # Prefer the per-row reason where the check recorded one (broker rules
+        # know whether it was the capital or the FIX value that was missing).
+        row_reason = reason
+        if src is not None and not src.empty and "_reason" in src.columns:
+            row_reason = src["_reason"].replace("", np.nan).fillna(reason)
         parts.append(frame(
             src, "Not Checked",
             actual_allocation=pd.to_numeric(src.get("allocation"), errors="coerce")
             if src is not None and not src.empty else None,
-            status=STATUS_NOT_CHECKED, remark=reason,
+            status=STATUS_NOT_CHECKED, remark=row_reason,
         ))
 
     parts = [p for p in parts if not p.empty]
