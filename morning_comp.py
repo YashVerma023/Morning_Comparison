@@ -255,6 +255,35 @@ def load_running_users(file) -> pd.DataFrame:
     return pd.read_excel(file)
 
 
+def merge_running_files(frames: list, labels: list) -> Optional[pd.DataFrame]:
+    """
+    Stack one or more Running files into a single frame.
+
+    Used when accounts run on a second index (e.g. BankNifty) and are exported
+    separately. Rows are kept as-is; a userid present in both files stays as
+    two rows, which the existing duplicate handling then reports.
+    """
+    usable = [(f, l) for f, l in zip(frames, labels) if f is not None and not f.empty]
+    if not usable:
+        return None
+    if len(usable) == 1:
+        return usable[0][0]
+
+    merged = pd.concat([f for f, _ in usable], ignore_index=True)
+    counts = ", ".join(f"{l} {len(f)}" for f, l in usable)
+    logger.info("Merged %d running files (%s) -> %d rows.", len(usable), counts, len(merged))
+    st.caption(f"Merged running files: {counts} -> **{len(merged)}** rows.")
+
+    if "userid" in merged.columns:
+        dupes = merged["userid"][merged["userid"].duplicated()].unique()
+        if len(dupes):
+            st.warning(
+                f"{len(dupes)} userid(s) appear in more than one running file: "
+                f"{', '.join(map(str, dupes[:10]))}{' ...' if len(dupes) > 10 else ''}."
+            )
+    return merged
+
+
 # -----------------------------
 # DUPLICATES
 # -----------------------------
@@ -905,21 +934,28 @@ def render_login_check(mode: str) -> None:
     """Existing morning reconciliation: All Users vs Running Users."""
     st.info(f"Running in **{mode}** mode. Change mode from the sidebar.")
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         file_all = st.file_uploader("Upload All Users Excel", type=["xlsx"])
     with col2:
         file_run = st.file_uploader("Upload Running Users", type=["csv", "xlsx"])
-
+    with col3:
+        file_run2 = st.file_uploader(
+            "Upload Running Users 2 (optional)", type=["csv", "xlsx"], key="login_run2",
+            help="Second running export, e.g. BankNifty. Merged with the first.",
+        )
 
     if file_all and file_run:
 
         st.success("Files uploaded successfully. Processing...")
 
         df_all = load_all_users(file_all)
-        df_run = load_running_users(file_run)
+        df_run = merge_running_files(
+            [load_running_users(f) for f in (file_run, file_run2) if f],
+            [file_run.name, file_run2.name if file_run2 else ""],
+        )
 
-        if df_all is None:
+        if df_all is None or df_run is None:
             st.stop()
 
         df_all = normalize_values(normalize_columns(df_all), is_running=False)
@@ -1380,16 +1416,21 @@ def render_allocation_check(mode: str) -> None:
     prev_req = ac.previous_day_requirement(mode, rules)
     show_prev = prev_req in (ac.PREV_REQUIRED, ac.PREV_OPTIONAL)
 
-    cols = st.columns(3 if show_prev else 2)
+    cols = st.columns(4 if show_prev else 3)
     with cols[0]:
         file_all = st.file_uploader("Upload Today's All Users Excel", type=["xlsx"],
                                     key="alloc_all")
     with cols[1]:
         file_run = st.file_uploader("Upload Running Users", type=["csv", "xlsx"],
                                     key="alloc_run")
+    with cols[2]:
+        file_run2 = st.file_uploader(
+            "Upload Running Users 2 (optional)", type=["csv", "xlsx"], key="alloc_run2",
+            help="Second running export, e.g. BankNifty. Merged with the first.",
+        )
     file_prev = None
     if show_prev:
-        with cols[2]:
+        with cols[3]:
             label = (
                 "Upload Previous Day All Users (required)"
                 if prev_req == ac.PREV_REQUIRED
@@ -1432,7 +1473,8 @@ def render_allocation_check(mode: str) -> None:
         return (getattr(f, "name", None), getattr(f, "size", None),
                 getattr(f, "file_id", None))
 
-    signature = (mode, _file_sig(file_all), _file_sig(file_run), _file_sig(file_prev))
+    signature = (mode, _file_sig(file_all), _file_sig(file_run),
+                 _file_sig(file_run2), _file_sig(file_prev))
 
     if st.session_state.get("alloc_signature") != signature:
         if st.session_state.get("alloc_ran"):
@@ -1457,7 +1499,12 @@ def render_allocation_check(mode: str) -> None:
     df_all = load_all_users_for_section(file_all)
     if df_all is None:
         return
-    df_run = load_running_for_allocation(file_run)
+    run_frames = [load_running_for_allocation(f) for f in (file_run, file_run2) if f]
+    if any(f is None for f in run_frames):   # a loader already showed the error
+        return
+    df_run = merge_running_files(
+        run_frames, [file_run.name, file_run2.name if file_run2 else ""]
+    )
     if df_run is None:
         return
 
