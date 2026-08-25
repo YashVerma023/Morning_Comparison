@@ -65,10 +65,7 @@
     "MSJ":  { "action": "jexception" }
   },
 
-  "broker_rules": {
-    "EXCELSTOCK": { "method": "capital_pct", "pct": 100 },
-    "VMATHRAMCO": { "method": "fix_allocation", "multiplier": 100000 }
-  },
+  "broker_rules": {},
 
   "fix": {
     "enabled": true,
